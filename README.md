@@ -134,6 +134,7 @@ openmcpgdb_debugger_state {}
 openmcpgdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c","linenumber":20}
 openmcpgdb_run {}
 openmcpgdb_next {}
+openmcpgdb_step {}
 openmcpgdb_full_backtrace {}
 openmcpgdb_quit {}
 ```
@@ -143,6 +144,24 @@ Type `quit` to exit the interactive client.
 ## Tool API
 
 All tool responses include `debugger_state` and optional fields like `variable_list`, `backtrace`, `current_code*`, and `error`.
+
+### `debugger_state` values
+
+- `not attached`
+- `failed to attach`
+- `attached`
+- `stopped at breakpoint`
+- `running`
+- `sigsegv`
+- `sigabrt`
+- `sigbus`
+- `sigfpe`
+- `sigill`
+- `sigtrap`
+- `sigterm`
+- `sigkill`
+- `exited`
+- `error`
 
 ### Execution/session
 

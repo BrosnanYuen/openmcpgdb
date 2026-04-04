@@ -1,8 +1,8 @@
 {
   "gdb_path": "/usr/bin/gdb",
   "gdb_options": "",
-  "codebase_dir": "/tmp",
-  "executable_path": "/tmp/exe",
+  "codebase_dir": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/",
+  "executable_path": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot",
   "mcp_server_name": "MCP GDB Server",
   "mcp_server_url": "https://localhost:9443",
   "display_lines_before_current": 7,

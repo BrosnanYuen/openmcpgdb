@@ -8,12 +8,24 @@ pub enum DebuggerState {
     NotAttached,
     #[serde(rename = "failed to attach")]
     FailedToAttach,
+    #[serde(rename = "attached")]
+    Attached,
     #[serde(rename = "stopped at breakpoint")]
     StoppedAtBreakpoint,
     #[serde(rename = "running")]
     Running,
     #[serde(rename = "sigsegv")]
     SigSegv,
+    #[serde(rename = "sigabrt")]
+    SigAbrt,
+    #[serde(rename = "sigbus")]
+    SigBus,
+    #[serde(rename = "sigfpe")]
+    SigFpe,
+    #[serde(rename = "sigill")]
+    SigIll,
+    #[serde(rename = "sigtrap")]
+    SigTrap,
     #[serde(rename = "sigterm")]
     SigTerm,
     #[serde(rename = "sigkill")]

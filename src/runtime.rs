@@ -59,11 +59,8 @@ async fn run_http_server(url: Url, factory: OpenMcpGdbServerFactory) -> Result<(
         .port_or_known_default()
         .ok_or_else(|| OpenMcpGdbError::InvalidUrl("missing port in mcp_server_url".to_string()))?;
 
-    let path = if url.path().is_empty() {
-        "/mcp"
-    } else {
-        url.path()
-    };
+    let raw_path = url.path();
+    let path = if raw_path.is_empty() { "/mcp" } else { raw_path };
     let bind_addr = format!("{host}:{port}");
 
     // rmcp manages per-client sessions for streamable-http mode.
@@ -74,8 +71,12 @@ async fn run_http_server(url: Url, factory: OpenMcpGdbServerFactory) -> Result<(
 
     let service: StreamableHttpService<OpenMcpGdbServer, LocalSessionManager> =
         StreamableHttpService::new(move || Ok(factory.build()), Default::default(), config);
-
-    let router = axum::Router::new().nest_service(path, service);
+    let router = if path == "/" {
+        // axum disallows nesting at root; attach MCP service as router fallback.
+        axum::Router::new().fallback_service(service)
+    } else {
+        axum::Router::new().nest_service(path, service)
+    };
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .map_err(OpenMcpGdbError::Io)?;

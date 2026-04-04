@@ -444,7 +444,7 @@ mod tests {
             }))
             .await
             .0;
-        assert_eq!(result.debugger_state, DebuggerState::NotAttached);
+        assert_eq!(result.debugger_state, DebuggerState::Attached);
 
         let calls = vec![
             server.openmcpgdb_run().await.0,
@@ -558,8 +558,14 @@ mod tests {
                 matches!(
                     response.debugger_state,
                     DebuggerState::NotAttached
+                        | DebuggerState::Attached
                         | DebuggerState::Running
                         | DebuggerState::StoppedAtBreakpoint
+                        | DebuggerState::SigAbrt
+                        | DebuggerState::SigBus
+                        | DebuggerState::SigFpe
+                        | DebuggerState::SigIll
+                        | DebuggerState::SigTrap
                         | DebuggerState::SigKill
                         | DebuggerState::Exited
                         | DebuggerState::Error

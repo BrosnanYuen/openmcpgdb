@@ -128,15 +128,23 @@ impl<'a> SessionCore<'a> {
     async fn execute(&mut self, operation: ToolOperation) -> Result<DebuggerResponse> {
         match operation {
             ToolOperation::Execute { executable_path } => {
+                println!(
+                    "[openmcpgdb_execute] requested executable_path={}",
+                    executable_path
+                );
                 self.execute_attach(executable_path).await
             }
             ToolOperation::Run => {
+                println!("[openmcpgdb_run] requested");
                 self.execute_command("run", Some(DebuggerState::Running))
                     .await
             }
             ToolOperation::TargetRemote { ip, port } => {
-                self.execute_command(&format!("target remote {ip}:{port}"), None)
-                    .await
+                self.execute_command(
+                    &format!("target remote {ip}:{port}"),
+                    Some(DebuggerState::Attached),
+                )
+                .await
             }
             ToolOperation::SetThread { id } => {
                 self.execute_command(&format!("thread {id}"), None).await
@@ -252,18 +260,30 @@ impl<'a> SessionCore<'a> {
         if !executable.is_absolute() {
             self.debugger_state = DebuggerState::FailedToAttach;
             self.last_error = "executable_path must be absolute".to_string();
+            eprintln!(
+                "[openmcpgdb_execute] failed: executable path is not absolute: {}",
+                executable_path
+            );
             return Ok(self.base_response().with_error(self.last_error.clone()));
         }
         match self.backend.start(&executable).await {
             Ok(_) => {
                 self.executable_path = Some(executable);
-                self.debugger_state = DebuggerState::NotAttached;
+                self.debugger_state = DebuggerState::Attached;
                 self.last_error.clear();
+                println!(
+                    "[openmcpgdb_execute] success: gdb started for {}",
+                    executable_path
+                );
                 Ok(self.base_response())
             }
             Err(err) => {
                 self.debugger_state = DebuggerState::FailedToAttach;
                 self.last_error = err.to_string();
+                eprintln!(
+                    "[openmcpgdb_execute] failed to start gdb for {}: {}",
+                    executable_path, self.last_error
+                );
                 Ok(self.base_response().with_error(self.last_error.clone()))
             }
         }
@@ -274,16 +294,35 @@ impl<'a> SessionCore<'a> {
         command: &str,
         fallback_state: Option<DebuggerState>,
     ) -> Result<DebuggerResponse> {
+        if let Err(err) = self.ensure_backend_started().await {
+            self.last_error = err.to_string();
+            self.debugger_state = DebuggerState::FailedToAttach;
+            if command == "run" {
+                eprintln!("[openmcpgdb_run] failed to prepare backend: {}", self.last_error);
+            }
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
+
         let result = self.backend.exec(command).await;
         match result {
             Ok(output) => {
                 self.update_state_from_output(&output, fallback_state);
                 self.last_error = String::new();
+                if command == "run" {
+                    println!(
+                        "[openmcpgdb_run] success: debugger_state={:?}, gdb_output={}",
+                        self.debugger_state,
+                        output.trim()
+                    );
+                }
                 Ok(self.base_response())
             }
             Err(err) => {
                 self.last_error = err.to_string();
                 self.debugger_state = DebuggerState::Error;
+                if command == "run" {
+                    eprintln!("[openmcpgdb_run] failed: {}", self.last_error);
+                }
                 Ok(self.base_response().with_error(self.last_error.clone()))
             }
         }
@@ -332,10 +371,6 @@ impl<'a> SessionCore<'a> {
 
     async fn collect_variable_list(&mut self) -> Result<BTreeMap<String, String>> {
         let mut variables = BTreeMap::new();
-        variables.insert(
-            "list_size".to_string(),
-            self.watched_variables.len().to_string(),
-        );
 
         for variable in self
             .watched_variables
@@ -407,7 +442,7 @@ impl<'a> SessionCore<'a> {
         if let Some(line) = line {
             let before = self.config.display_lines_before_current as u64;
             let after = self.config.display_lines_after_current as u64;
-            let start = line.saturating_sub(before);
+            let start = std::cmp::max(1, line.saturating_sub(before));
             let end = line + after;
             let list_output = self
                 .backend
@@ -415,10 +450,8 @@ impl<'a> SessionCore<'a> {
                 .await
                 .unwrap_or_default();
             for raw_line in list_output.lines() {
-                if let Some((number, source)) = raw_line.split_once('\t') {
-                    if number.chars().all(|char| char.is_ascii_digit()) {
-                        code_lines.insert(number.trim().to_string(), source.to_string());
-                    }
+                if let Some((number, source)) = parse_gdb_list_line(raw_line) {
+                    code_lines.insert(number.to_string(), source.to_string());
                 }
             }
         }
@@ -446,6 +479,26 @@ impl<'a> SessionCore<'a> {
             self.debugger_state = DebuggerState::SigSegv;
             return;
         }
+        if lower.contains("sigabrt") {
+            self.debugger_state = DebuggerState::SigAbrt;
+            return;
+        }
+        if lower.contains("sigbus") {
+            self.debugger_state = DebuggerState::SigBus;
+            return;
+        }
+        if lower.contains("sigfpe") {
+            self.debugger_state = DebuggerState::SigFpe;
+            return;
+        }
+        if lower.contains("sigill") {
+            self.debugger_state = DebuggerState::SigIll;
+            return;
+        }
+        if lower.contains("sigtrap") {
+            self.debugger_state = DebuggerState::SigTrap;
+            return;
+        }
         if lower.contains("sigterm") {
             self.debugger_state = DebuggerState::SigTerm;
             return;
@@ -465,6 +518,24 @@ impl<'a> SessionCore<'a> {
         if let Some(state) = fallback_state {
             self.debugger_state = state;
         }
+    }
+
+    async fn ensure_backend_started(&mut self) -> Result<()> {
+        if self.executable_path.is_some() {
+            return Ok(());
+        }
+
+        let configured_path = self.config.executable_path.clone();
+        if !configured_path.is_absolute() {
+            return Err(OpenMcpGdbError::InvalidConfig(
+                "configured executable_path must be absolute".to_string(),
+            ));
+        }
+
+        self.backend.start(&configured_path).await?;
+        self.executable_path = Some(configured_path);
+        self.debugger_state = DebuggerState::Attached;
+        Ok(())
     }
 }
 
@@ -494,4 +565,50 @@ fn parse_path_and_line(frame_output: &str) -> (Option<String>, Option<u64>) {
         }
     }
     (None, None)
+}
+
+fn parse_gdb_list_line(line: &str) -> Option<(u64, &str)> {
+    let trimmed = line.trim_start();
+    let digits_len = trimmed
+        .chars()
+        .take_while(|char| char.is_ascii_digit())
+        .count();
+    if digits_len == 0 {
+        return None;
+    }
+
+    let (digits, rest) = trimmed.split_at(digits_len);
+    let number = digits.parse::<u64>().ok()?;
+    // Preserve original source indentation: strip only the first field separator.
+    let source = if let Some(stripped) = rest.strip_prefix('\t') {
+        stripped
+    } else if let Some(stripped) = rest.strip_prefix(' ') {
+        stripped
+    } else {
+        rest
+    };
+    Some((number, source))
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::parse_gdb_list_line;
+
+    #[test]
+    fn test_parse_gdb_list_line_preserves_space_indentation() {
+        let parsed = parse_gdb_list_line("23\t    simulator_init(&g_sim, rows, cols, seed);");
+        assert!(parsed.is_some(), "line should parse");
+        let (line_no, source) = parsed.expect("parsed line");
+        assert_eq!(line_no, 23);
+        assert_eq!(source, "    simulator_init(&g_sim, rows, cols, seed);");
+    }
+
+    #[test]
+    fn test_parse_gdb_list_line_preserves_tab_indentation() {
+        let parsed = parse_gdb_list_line("24\t\trobot_init(&g_robot, &g_sim);");
+        assert!(parsed.is_some(), "line should parse");
+        let (line_no, source) = parsed.expect("parsed line");
+        assert_eq!(line_no, 24);
+        assert_eq!(source, "\trobot_init(&g_robot, &g_sim);");
+    }
 }
