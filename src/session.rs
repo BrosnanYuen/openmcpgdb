@@ -357,7 +357,7 @@ impl<'a> SessionCore<'a> {
         response.current_func = current_func;
         let code = self.collect_current_code().await?;
         response.current_code_path = code.0;
-        response.current_code_line = code.1;
+        response.current_code_line = code.1.and_then(|line| i64::try_from(line).ok());
         response.current_code = code.2.map(|lines| self.transform_current_code(lines));
         Ok(response)
     }
@@ -409,7 +409,7 @@ impl<'a> SessionCore<'a> {
         let mut response = self.base_response();
         let code = self.collect_current_code().await?;
         response.current_code_path = code.0;
-        response.current_code_line = code.1;
+        response.current_code_line = code.1.and_then(|line| i64::try_from(line).ok());
         response.current_code = code.2.map(|lines| self.transform_current_code(lines));
         Ok(response)
     }

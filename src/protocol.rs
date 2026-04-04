@@ -57,7 +57,7 @@ pub struct DebuggerResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_code_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_code_line: Option<u64>,
+    pub current_code_line: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_code: Option<CurrentCodePayload>,
     #[serde(default)]
