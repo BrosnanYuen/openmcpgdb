@@ -131,16 +131,19 @@ Input format:
 <tool_name> <json-args>
 ```
 
-Examples:
+Examples of Debugging on local GDB:
 
 ```text
 openmcpgdb_execute {"executable_path":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot"}
 openmcpgdb_debugger_state {}
+openmcpgdb_add_variable_list {"var":"robot_state"}
 openmcpgdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c","linenumber":20}
 openmcpgdb_run {}
 openmcpgdb_next {}
 openmcpgdb_step {}
+openmcpgdb_print {"var":"counter"}
 openmcpgdb_full_backtrace {}
+openmcpgdb_continue {}
 openmcpgdb_quit {}
 ```
 
