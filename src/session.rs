@@ -163,7 +163,7 @@ impl<'a> SessionCore<'a> {
             } => {
                 self.execute_command(
                     &format!("break {filename}:{linenumber}"),
-                    Some(DebuggerState::StoppedAtBreakpoint),
+                    None,
                 )
                 .await
             }
@@ -260,7 +260,7 @@ impl<'a> SessionCore<'a> {
                 self.config.display_variable_list = size;
                 Ok(self.base_response())
             }
-            ToolOperation::Custom { cmd } => self.execute_command(&cmd, None).await,
+            ToolOperation::Custom { cmd } => self.execute_command_with_output(&cmd, None).await,
         }
     }
 
@@ -432,7 +432,20 @@ impl<'a> SessionCore<'a> {
         command: &str,
         fallback_state: DebuggerState,
     ) -> Result<DebuggerResponse> {
-        let _ = self.execute_command(command, Some(fallback_state)).await?;
+        let response = self.execute_command(command, Some(fallback_state)).await?;
+        match response.debugger_state {
+            DebuggerState::Error
+            | DebuggerState::SigSegv
+            | DebuggerState::SigAbrt
+            | DebuggerState::SigBus
+            | DebuggerState::SigFpe
+            | DebuggerState::SigIll
+            | DebuggerState::SigTrap
+            | DebuggerState::SigTerm
+            | DebuggerState::SigKill
+            | DebuggerState::Exited => return Ok(response),
+            _ => {}
+        }
         self.full_snapshot_response().await
     }
 
@@ -477,7 +490,7 @@ impl<'a> SessionCore<'a> {
                     .lines()
                     .map(str::trim_end)
                     .filter(|line| !line.is_empty())
-                    .map(ToString::to_string)
+                    .map(|line| line.strip_prefix("(gdb) ").unwrap_or(line).to_string())
                     .collect();
 
                 let mut response = self.base_response();
@@ -567,7 +580,7 @@ impl<'a> SessionCore<'a> {
         Option<u64>,
         Option<BTreeMap<u64, String>>,
     )> {
-        let frame = self.backend.exec("frame").await.unwrap_or_default();
+        let frame = self.backend.exec("frame").await?;
         let (path, line) = parse_path_and_line(&frame);
 
         let mut code_lines = BTreeMap::new();
@@ -579,8 +592,7 @@ impl<'a> SessionCore<'a> {
             let list_output = self
                 .backend
                 .exec(&format!("list {start},{end}"))
-                .await
-                .unwrap_or_default();
+                .await?;
             for raw_line in list_output.lines() {
                 if let Some((number, source)) = parse_gdb_list_line(raw_line) {
                     code_lines.insert(number, source.to_string());
@@ -607,23 +619,28 @@ impl<'a> SessionCore<'a> {
 
     fn update_state_from_output(&mut self, output: &str, fallback_state: Option<DebuggerState>) {
         let lower = output.to_ascii_lowercase();
-        if lower.contains("sigsegv") {
+
+        // Signal detection: check both explicit signal names and descriptive messages.
+        if lower.contains("sigsegv") || lower.contains("segmentation fault") {
             self.debugger_state = DebuggerState::SigSegv;
             return;
         }
-        if lower.contains("sigabrt") {
+        if lower.contains("sigabrt")
+            || (lower.contains("signal received") && lower.contains("sigabrt"))
+            || lower.contains("program received signal sigabrt")
+        {
             self.debugger_state = DebuggerState::SigAbrt;
             return;
         }
-        if lower.contains("sigbus") {
+        if lower.contains("sigbus") || lower.contains("bus error") {
             self.debugger_state = DebuggerState::SigBus;
             return;
         }
-        if lower.contains("sigfpe") {
+        if lower.contains("sigfpe") || lower.contains("floating point exception") {
             self.debugger_state = DebuggerState::SigFpe;
             return;
         }
-        if lower.contains("sigill") {
+        if lower.contains("sigill") || lower.contains("illegal instruction") {
             self.debugger_state = DebuggerState::SigIll;
             return;
         }
@@ -639,14 +656,99 @@ impl<'a> SessionCore<'a> {
             self.debugger_state = DebuggerState::SigKill;
             return;
         }
-        if lower.contains("breakpoint") {
+        if lower.contains("sighup") {
+            self.debugger_state = DebuggerState::SigTerm;
+            return;
+        }
+        if lower.contains("sigpipe") {
+            self.debugger_state = DebuggerState::SigTerm;
+            return;
+        }
+        if lower.contains("sigxcpu") || lower.contains("sigxfsz") {
+            self.debugger_state = DebuggerState::SigTerm;
+            return;
+        }
+        if lower.contains("sigint") && !lower.contains("breakpoint") {
             self.debugger_state = DebuggerState::StoppedAtBreakpoint;
             return;
         }
-        if lower.contains("exited") {
+
+        // Generic "program received signal" pattern (catches any unhandled signal).
+        if lower.contains("program received signal") {
+            self.debugger_state = DebuggerState::Error;
+            return;
+        }
+        if lower.contains("terminated with signal") {
+            self.debugger_state = DebuggerState::Error;
+            return;
+        }
+
+        // Breakpoint, watchpoint, and catchpoint stop detection.
+        if lower.contains("breakpoint") {
+            let is_creation = lower.contains("breakpoint ")
+                && (lower.contains(" at 0x") || lower.contains(" num "));
+            if is_creation {
+                return;
+            }
+            self.debugger_state = DebuggerState::StoppedAtBreakpoint;
+            return;
+        }
+        if lower.contains("watchpoint") || lower.contains("hardware watchpoint") {
+            self.debugger_state = DebuggerState::StoppedAtBreakpoint;
+            return;
+        }
+        if lower.contains("catchpoint") {
+            self.debugger_state = DebuggerState::StoppedAtBreakpoint;
+            return;
+        }
+
+        // Program termination and exit detection.
+        if lower.contains("exited normally")
+            || lower.contains("exited with code")
+            || lower.contains("exited abnormally")
+            || (lower.contains("inferior") && lower.contains("exited"))
+        {
             self.debugger_state = DebuggerState::Exited;
             return;
         }
+
+        // Running state detection from GDB output.
+        if lower.contains("continuing") || lower.contains("starting program") {
+            self.debugger_state = DebuggerState::Running;
+            return;
+        }
+
+        // Program not running / no context detection.
+        if lower.contains("no stack") || lower.contains("no registers") {
+            self.debugger_state = DebuggerState::Exited;
+            return;
+        }
+        if lower.contains("the program is not being run")
+            || lower.contains("no inferior")
+            || lower.contains("the program has no registers now")
+        {
+            self.debugger_state = DebuggerState::NotAttached;
+            return;
+        }
+
+        // User interrupt detection.
+        if lower.contains("interrupted") {
+            self.debugger_state = DebuggerState::StoppedAtBreakpoint;
+            return;
+        }
+
+        // Memory access error detection.
+        if lower.contains("cannot access memory") {
+            self.debugger_state = DebuggerState::Error;
+            return;
+        }
+
+        // Detaching / process finished detection.
+        if lower.contains("detaching") || lower.contains("process finished") {
+            self.debugger_state = DebuggerState::NotAttached;
+            return;
+        }
+
         if let Some(state) = fallback_state {
             self.debugger_state = state;
         }
@@ -711,10 +813,11 @@ fn normalize_gdb_value(output: &str) -> String {
 
 fn normalized_command_output(output: &str) -> Option<String> {
     let trimmed = output.trim();
-    if trimmed.is_empty() {
+    let stripped = trimmed.strip_prefix("(gdb) ").unwrap_or(trimmed);
+    if stripped.is_empty() {
         None
     } else {
-        Some(trimmed.to_string())
+        Some(stripped.to_string())
     }
 }
 
@@ -831,5 +934,24 @@ mod parse_tests {
         let (frame_no, function) = parsed.expect("parsed frame");
         assert_eq!(frame_no, 0);
         assert_eq!(function, "compute_pi");
+    }
+
+    #[test]
+    fn test_list_breakpoint_strips_gdb_prompt() {
+        let input = "(gdb) Num     Type           Disp Enb Address            What\n1       breakpoint     keep y   0x00005555555551cb in main at src/main.c:10\n";
+        let lines: Vec<String> = input
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .map(|line| line.strip_prefix("(gdb) ").unwrap_or(line).to_string())
+            .collect();
+
+        assert_eq!(lines.len(), 2);
+        assert!(!lines[0].starts_with("(gdb)"));
+        assert!(!lines[1].starts_with("(gdb)"));
+        assert_eq!(
+            lines[0],
+            "Num     Type           Disp Enb Address            What"
+        );
     }
 }

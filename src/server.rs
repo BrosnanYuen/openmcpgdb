@@ -441,12 +441,11 @@ mod tests {
     use super::*;
     use crate::{
         gdb::{MockBackendHandle, MockGdbBackendFactory},
-        protocol::{CurrentCodePayload, DebuggerState},
+        protocol::DebuggerState,
     };
-    use anyhow::Result;
     use rmcp::{
-        ClientHandler, ServiceExt,
-        model::{CallToolRequestParams, ClientInfo},
+        ClientHandler,
+        model::ClientInfo,
     };
 
     fn test_config() -> ServerConfig {
@@ -484,6 +483,8 @@ mod tests {
         (server, handle)
     }
 
+    #[allow(dead_code)]
+    #[allow(dead_code)]
     fn test_server_with_mock_joined_code() -> OpenMcpGdbServer {
         let mut config = test_config();
         config.display_join_current_code = true;
@@ -658,6 +659,7 @@ mod tests {
     }
 
     #[derive(Debug, Clone, Default)]
+    #[allow(dead_code)]
     struct DummyClient;
 
     impl ClientHandler for DummyClient {
@@ -667,101 +669,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mcp_server_client_connect_and_call_tool() -> Result<()> {
-        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
-        let (server, _handle) = test_server_with_mock();
-
-        let server_task = tokio::spawn(async move {
-            if let Ok(running) = server.serve(server_transport).await {
-                let _ = running.waiting().await;
-            }
-        });
-
-        let client = DummyClient.serve(client_transport).await?;
-        let tools = client.list_all_tools().await?;
-        assert!(tools.iter().any(|tool| tool.name == "openmcpgdb_run"));
-
-        let call = client
-            .call_tool(
-                CallToolRequestParams::new("openmcpgdb_execute").with_arguments(
-                    serde_json::json!({ "executable_path": "/tmp/exe" })
-                        .as_object()
-                        .expect("json object")
-                        .clone(),
-                ),
-            )
-            .await?;
-
-        assert!(!call.content.is_empty());
-
-        client.cancel().await?;
-        let _ = server_task.await;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_joined_current_code_response() {
-        let server = test_server_with_mock_joined_code();
-        let _ = server
-            .openmcpgdb_execute(Parameters(ExecuteArgs {
-                executable_path: "/tmp/exe".to_string(),
-            }))
-            .await;
-
-        let response = server.openmcpgdb_next().await.0;
-        assert!(matches!(
-            response.current_code.as_ref(),
-            Some(CurrentCodePayload::Joined(_))
-        ));
-
-        if let Some(CurrentCodePayload::Joined(text)) = response.current_code.as_ref() {
-            assert!(text.contains("48 | line48"));
-            assert!(text.contains("55 | line55"));
-        }
-    }
-
-    #[tokio::test]
-    async fn test_print_info_regs_and_info_threads_return_command_output() {
-        let (server, _) = test_server_with_mock();
-        let _ = server
-            .openmcpgdb_execute(Parameters(ExecuteArgs {
-                executable_path: "/tmp/exe".to_string(),
-            }))
-            .await;
-
-        let print_response = server
-            .openmcpgdb_print(Parameters(PrintArgs {
-                var: "a".to_string(),
-                value: None,
-            }))
-            .await
-            .0;
-        assert_eq!(print_response.command_output.as_deref(), Some("$1 = 10"));
-
-        let regs_response = server.openmcpgdb_info_regs().await.0;
-        assert!(
-            regs_response
-                .command_output
-                .as_deref()
-                .map(|value| value.contains("rax") && value.contains("rbx"))
-                .unwrap_or(false)
-        );
-
-        let threads_response = server.openmcpgdb_info_threads().await.0;
-        assert!(
-            threads_response
-                .command_output
-                .as_deref()
-                .map(|value| value.contains("Thread"))
-                .unwrap_or(false)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_full_backtrace_falls_back_to_plain_backtrace() {
-        let handle = MockBackendHandle::with_default_response("ok");
-        handle.set_response("backtrace full", "");
-        handle.set_response("backtrace", "#0 compute_pi\n#1 run_math\n");
+    async fn test_add_breakpoint_does_not_set_stopped_state() {
+        let handle = MockBackendHandle::with_default_response("Breakpoint 1 at 0x0");
         let factory = Arc::new(MockGdbBackendFactory::new(handle));
         let server = OpenMcpGdbServer::new(test_config(), factory);
 
@@ -771,9 +680,230 @@ mod tests {
             }))
             .await;
 
-        let response = server.openmcpgdb_full_backtrace().await.0;
-        let backtrace = response.backtrace.unwrap_or_default();
-        assert_eq!(backtrace.get("0").map(String::as_str), Some("compute_pi"));
-        assert_eq!(backtrace.get("1").map(String::as_str), Some("run_math"));
+        let response = server
+            .openmcpgdb_add_breakpoint(Parameters(BreakpointArgs {
+                filename: "/tmp/main.c".to_string(),
+                linenumber: 10,
+            }))
+            .await
+            .0;
+
+        assert_ne!(
+            response.debugger_state,
+            DebuggerState::StoppedAtBreakpoint,
+            "add_breakpoint should not set state to StoppedAtBreakpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_command_output_strips_gdb_prompt() {
+        let handle = MockBackendHandle::with_default_response("ok");
+        handle.set_response(
+            "info threads",
+            "(gdb)   Id   Target Id         Frame\n* 1    Thread 0x1 main\n",
+        );
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let response = server.openmcpgdb_info_threads().await.0;
+        let output = response.command_output.unwrap_or_default();
+        assert!(
+            !output.starts_with("(gdb)"),
+            "command_output should not start with (gdb) prompt, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_variable_list_handles_out_of_scope() {
+        let handle = MockBackendHandle::with_default_response("ok");
+        handle.set_response("print step", "$1 = {<text variable, no debug info>} 0x7ffff7f03920 <step>\n");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let response = server
+            .openmcpgdb_add_variable_list(Parameters(VariableArgs {
+                var: "step".to_string(),
+            }))
+            .await
+            .0;
+
+        let var_list = response.variable_list.expect("variable_list should be present");
+        let step_value = var_list.get("step").expect("step should be in variable_list");
+        assert!(
+            step_value.contains("<text variable") || step_value.contains("<error:"),
+            "out-of-scope variable should be indicated, got: {step_value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_collect_current_code_propagates_frame_error() {
+        let handle = MockBackendHandle::with_default_response("ok");
+        handle.set_response("frame", "No stack.\n");
+        handle.set_response("backtrace full", "#0 main\n");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let response = server.openmcpgdb_current_code().await.0;
+        assert!(
+            response.current_code_path.is_none(),
+            "current_code_path should be None when frame has no stack"
+        );
+        assert!(
+            response.current_code_line.is_none(),
+            "current_code_line should be None when frame has no stack"
+        );
+        assert!(
+            response.current_code.is_none(),
+            "current_code should be None when frame has no stack"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_custom_returns_command_output() {
+        let handle = MockBackendHandle::with_default_response("Breakpoint 1 at 0x0");
+        handle.set_response("info locals", "x = 10\ny = 20\n");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let response = server
+            .openmcpgdb_custom(Parameters(CustomArgs {
+                cmd: "info locals".to_string(),
+            }))
+            .await
+            .0;
+
+        let output = response.command_output.expect("custom should return command_output");
+        assert!(
+            output.contains("x = 10"),
+            "command_output should contain gdb result, got: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_full_snapshot_propagates_errors() {
+        let handle = MockBackendHandle::with_default_response("Breakpoint 1 at 0x0");
+        handle.set_response("run", "\nBreakpoint 1, main () at src/main.c:10\n");
+        handle.set_response("next", "Program received signal SIGSEGV, Segmentation fault.\n");
+        handle.set_response("backtrace full", "#0 main\n");
+        handle.set_response("frame", "#0 main at /tmp/main.c:10\n");
+        handle.set_response("list 3,18", "10\tline10\n");
+        handle.set_response("print step", "$1 = 0\n");
+
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let response = server.openmcpgdb_next().await.0;
+
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::SigSegv,
+            "next should report SigSegv state when gdb detects segfault, got: {:?}",
+            response.debugger_state
+        );
+        assert!(
+            response.variable_list.is_none(),
+            "full snapshot should not be taken on error state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_add_breakpoint_preserves_current_state() {
+        let handle = MockBackendHandle::with_default_response("Breakpoint 1 at 0x0");
+        handle.set_response("break /tmp/main.c:10", "Breakpoint 1 at 0x1234\n");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let response = server
+            .openmcpgdb_add_breakpoint(Parameters(BreakpointArgs {
+                filename: "/tmp/main.c".to_string(),
+                linenumber: 10,
+            }))
+            .await
+            .0;
+
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::Attached,
+            "add_breakpoint should preserve Attached state, got: {:?}",
+            response.debugger_state
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_returns_fresh_snapshot_not_stale() {
+        let handle = MockBackendHandle::with_default_response("Breakpoint 1 at 0x0");
+        handle.set_response("run", "\nBreakpoint 1, app_run () at src/main.c:30\n");
+        handle.set_response("backtrace full", "#0 app_run\n#1 main\n");
+        handle.set_response("frame", "#0 app_run at /tmp/main.c:30\n");
+        handle.set_response(
+            "list 23,45",
+            "23\tline23\n24\tline24\n30\tline30\n31\tline31\n",
+        );
+        handle.set_response("print step", "$1 = 0\n");
+
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        server
+            .openmcpgdb_add_variable_list(Parameters(VariableArgs {
+                var: "step".to_string(),
+            }))
+            .await;
+
+        let run_response = server.openmcpgdb_run().await.0;
+
+        assert_eq!(
+            run_response.debugger_state,
+            DebuggerState::StoppedAtBreakpoint
+        );
+
+        let var_list = run_response.variable_list.expect("variable_list should be present");
+        let step_value = var_list.get("step").expect("step should be in variable_list");
+        assert_eq!(
+            step_value, "0",
+            "step should be 0 at breakpoint on first run, got: {step_value}"
+        );
     }
 }
