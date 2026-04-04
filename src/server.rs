@@ -47,6 +47,12 @@ struct PrintArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetVarArgs {
+    var: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SizeArgs {
     size: usize,
 }
@@ -305,6 +311,21 @@ impl OpenMcpGdbServer {
     }
 
     #[tool(
+        name = "openmcpgdb_set_var",
+        description = "Set variable value (gdb set variable <var> = <value>)"
+    )]
+    async fn openmcpgdb_set_var(
+        &self,
+        Parameters(args): Parameters<SetVarArgs>,
+    ) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::Print {
+            var: args.var,
+            value: Some(args.value),
+        })
+        .await
+    }
+
+    #[tool(
         name = "openmcpgdb_info_regs",
         description = "Get register information"
     )]
@@ -539,6 +560,13 @@ mod tests {
                 .openmcpgdb_print(Parameters(PrintArgs {
                     var: "a".to_string(),
                     value: Some("12".to_string()),
+                }))
+                .await
+                .0,
+            server
+                .openmcpgdb_set_var(Parameters(SetVarArgs {
+                    var: "a".to_string(),
+                    value: "13".to_string(),
                 }))
                 .await
                 .0,

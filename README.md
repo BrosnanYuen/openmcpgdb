@@ -146,6 +146,75 @@ openmcpgdb_quit {}
 
 Type `quit` to exit the interactive client.
 
+## Use With MCP Clients
+
+This server is compatible with MCP clients that support either:
+- command-based stdio servers
+- streamable HTTP servers
+
+### opencode (stdio recommended)
+
+Use MCP server command settings pointing to:
+
+```bash
+cargo run --bin openmcpgdb -- /home/brosnan/openmcpgdb/openmcpgdb/config.json
+```
+
+And set in config:
+
+```json
+"mcp_server_url": "stdio://local"
+```
+
+### OpenAI Codex clients
+
+You can use either mode:
+
+1. `stdio` mode:
+- server command:
+```bash
+cargo run --bin openmcpgdb -- /home/brosnan/openmcpgdb/openmcpgdb/config.json
+```
+- config URL:
+```json
+"mcp_server_url": "stdio://local"
+```
+
+2. HTTP mode:
+- run server with:
+```json
+"mcp_server_url": "https://localhost:9443"
+```
+- connect client MCP endpoint to:
+```text
+http://localhost:9443
+```
+
+### Claude Code clients
+
+For local development, prefer stdio:
+
+```bash
+cargo run --bin openmcpgdb -- /home/brosnan/openmcpgdb/openmcpgdb/config.json
+```
+
+with:
+
+```json
+"mcp_server_url": "stdio://local"
+```
+
+If you use HTTP transport, point the client to:
+
+```text
+http://localhost:9443
+```
+
+### Important transport note
+
+`https://localhost:9443` is accepted in this project config as a default URL shape, but the current server bind is plain HTTP.  
+For true TLS HTTPS, run behind a TLS reverse proxy and expose an HTTPS endpoint there.
+
 ## Tool API
 
 All tool responses include `debugger_state` and optional fields like `variable_list`, `backtrace`, `current_code*`, and `error`.
@@ -205,6 +274,7 @@ All tool responses include `debugger_state` and optional fields like `variable_l
 - `openmcpgdb_info_regs()`
 - `openmcpgdb_print(var)`
 - `openmcpgdb_print(var, value)`
+- `openmcpgdb_set_var(var, value)`
 
 ### Control/config/custom
 
