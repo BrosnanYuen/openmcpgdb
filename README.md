@@ -273,7 +273,6 @@ All tool responses include `debugger_state` and optional fields like `variable_l
 - `openmcpgdb_info_threads()`
 - `openmcpgdb_info_regs()`
 - `openmcpgdb_print(var)`
-- `openmcpgdb_print(var, value)`
 - `openmcpgdb_set_var(var, value)`
 
 ### Control/config/custom
