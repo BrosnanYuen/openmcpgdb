@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <time.h>
 #include "maze.h"
 #include "simulator.h"
@@ -50,8 +51,11 @@ static void app_cleanup(void) {
 int main(void) {
     AppFunc funcs[] = {app_init, app_run, app_cleanup};
 
-    for (int i = 0; i < 3; i++) {
-        funcs[i]();
+    while (1) {
+        for (int i = 0; i < 3; i++) {
+            funcs[i]();
+        }
+        sleep(1);
     }
 
     return 0;

@@ -25,6 +25,13 @@ struct TargetRemoteArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct GdbServerArgs {
+    ip: String,
+    port: u16,
+    pid: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct IdArgs {
     id: i64,
 }
@@ -128,6 +135,22 @@ impl OpenMcpGdbServer {
     #[tool(name = "openmcpgdb_run", description = "Run executable in gdb")]
     async fn openmcpgdb_run(&self) -> Json<DebuggerResponse> {
         self.call_operation(ToolOperation::Run).await
+    }
+
+    #[tool(
+        name = "openmcpgdb_gdbserver",
+        description = "Start gdbserver and attach to a pid"
+    )]
+    async fn openmcpgdb_gdbserver(
+        &self,
+        Parameters(args): Parameters<GdbServerArgs>,
+    ) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::GdbServer {
+            ip: args.ip,
+            port: args.port,
+            pid: args.pid,
+        })
+        .await
     }
 
     #[tool(
@@ -491,6 +514,14 @@ mod tests {
         let calls = vec![
             server.openmcpgdb_run().await.0,
             server
+                .openmcpgdb_gdbserver(Parameters(GdbServerArgs {
+                    ip: "127.0.0.1".to_string(),
+                    port: 1234,
+                    pid: -1,
+                }))
+                .await
+                .0,
+            server
                 .openmcpgdb_target_remote(Parameters(TargetRemoteArgs {
                     ip: "127.0.0.1".to_string(),
                     port: 1234,
@@ -607,6 +638,8 @@ mod tests {
                 matches!(
                     response.debugger_state,
                     DebuggerState::NotAttached
+                        | DebuggerState::FailedToAttach
+                        | DebuggerState::GdbServerAttached
                         | DebuggerState::Attached
                         | DebuggerState::Running
                         | DebuggerState::StoppedAtBreakpoint

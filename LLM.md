@@ -18,11 +18,12 @@ Rules:
 - After each tool call, read and use `debugger_state`.
 - Prefer this flow:
   1) openmcpgdb_execute
-  2) breakpoint setup
-  3) openmcpgdb_run
-  4) step/next/continue loops
-  5) inspect state (current_code, variable_list, full_backtrace, info_threads, info_regs, print)
-  6) stop session with openmcpgdb_quit
+  2) optional openmcpgdb_gdbserver + openmcpgdb_target_remote for remote pid attach
+  3) breakpoint setup
+  4) openmcpgdb_run
+  5) step/next/continue loops
+  6) inspect state (current_code, variable_list, full_backtrace, info_threads, info_regs, print)
+  7) stop session with openmcpgdb_quit
 - When modifying values, use openmcpgdb_set_var (or openmcpgdb_print with value).
 - If debugger_state is `not attached` or `failed to attach`, recover by calling openmcpgdb_execute again with the correct absolute executable path.
 - If debugger_state indicates a signal (sigsegv/sigabrt/sigbus/sigfpe/sigill/sigtrap/sigterm/sigkill), immediately collect:
@@ -36,10 +37,27 @@ Rules:
   - next debugging action
 ```
 
-## 2. Debug Session Example on Local GDB
+## 2. Debug Session Example 
 
+Examples of Debugging on  Local GDB:
 ```text
 openmcpgdb_execute {"executable_path":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot"}
+openmcpgdb_debugger_state {}
+openmcpgdb_add_variable_list {"var":"robot_state"}
+openmcpgdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c","linenumber":20}
+openmcpgdb_run {}
+openmcpgdb_next {}
+openmcpgdb_step {}
+openmcpgdb_print {"var":"counter"}
+openmcpgdb_full_backtrace {}
+openmcpgdb_continue {}
+openmcpgdb_quit {}
+```
+
+Examples of Debugging on gdbserver on exsisting PID:
+```
+openmcpgdb_gdbserver {"ip":"127.0.0.1","port":11234,"pid":12345}
+openmcpgdb_target_remote {"ip":"127.0.0.1","port":11234}
 openmcpgdb_debugger_state {}
 openmcpgdb_add_variable_list {"var":"robot_state"}
 openmcpgdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c","linenumber":20}
@@ -78,6 +96,15 @@ openmcpgdb_execute {"executable_path":"/absolute/path/to/program"}
 - Expected response: often `running` or `stopped at breakpoint`; on crash may return signal states.
 ```text
 openmcpgdb_run {}
+```
+
+`openmcpgdb_gdbserver`
+- What it does: starts `gdbserver --attach <ip>:<port> <pid>` from the MCP server process.
+- Arguments: `ip` (string), `port` (u16), `pid` (i64, must be > 0).
+- Call this when: attaching gdbserver to a running process before connecting with `openmcpgdb_target_remote`.
+- Expected response: `gdbserver attached` on success; `failed to attach` with error details otherwise.
+```text
+openmcpgdb_gdbserver {"ip":"127.0.0.1","port":1234,"pid":12345}
 ```
 
 `openmcpgdb_target_remote`
@@ -347,16 +374,17 @@ openmcpgdb_custom {"cmd":"info locals"}
 Use this loop repeatedly:
 
 1. Ensure debugger is attached (`openmcpgdb_execute` if needed).
-2. Install breakpoints.
-3. Start/resume execution (`openmcpgdb_run` / `openmcpgdb_continue`).
-4. On stop/crash, collect:
+2. For remote attach, start gdbserver (`openmcpgdb_gdbserver`) then connect (`openmcpgdb_target_remote`).
+3. Install breakpoints.
+4. Start/resume execution (`openmcpgdb_run` / `openmcpgdb_continue`).
+5. On stop/crash, collect:
    - `openmcpgdb_current_code`
    - `openmcpgdb_full_backtrace`
    - `openmcpgdb_variable_list`
    - `openmcpgdb_info_regs` (for low-level failures)
-5. Use `openmcpgdb_step`/`openmcpgdb_next` for root-cause isolation.
-6. Optionally change runtime variables (`openmcpgdb_set_var`).
-7. End with `openmcpgdb_quit`.
+6. Use `openmcpgdb_step`/`openmcpgdb_next` for root-cause isolation.
+7. Optionally change runtime variables (`openmcpgdb_set_var`).
+8. End with `openmcpgdb_quit`.
 
 ## 5. Debugger State Values to Handle
 
@@ -364,6 +392,7 @@ The LLM should branch behavior based on `debugger_state`, including:
 
 - `not attached`
 - `failed to attach`
+- `gdbserver attached`
 - `attached`
 - `stopped at breakpoint`
 - `running`

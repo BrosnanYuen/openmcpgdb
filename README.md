@@ -147,6 +147,22 @@ openmcpgdb_continue {}
 openmcpgdb_quit {}
 ```
 
+Examples of Debugging on gdbserver on exsisting PID:
+```
+openmcpgdb_gdbserver {"ip":"127.0.0.1","port":11234,"pid":12345}
+openmcpgdb_target_remote {"ip":"127.0.0.1","port":11234}
+openmcpgdb_debugger_state {}
+openmcpgdb_add_variable_list {"var":"robot_state"}
+openmcpgdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c","linenumber":20}
+openmcpgdb_run {}
+openmcpgdb_next {}
+openmcpgdb_step {}
+openmcpgdb_print {"var":"counter"}
+openmcpgdb_full_backtrace {}
+openmcpgdb_continue {}
+openmcpgdb_quit {}
+```
+
 Type `quit` to exit the interactive client.
 
 ## Use With MCP Clients
@@ -226,6 +242,7 @@ All tool responses include `debugger_state` and optional fields like `variable_l
 
 - `not attached`
 - `failed to attach`
+- `gdbserver attached`
 - `attached`
 - `stopped at breakpoint`
 - `running`
@@ -244,6 +261,7 @@ All tool responses include `debugger_state` and optional fields like `variable_l
 
 - `openmcpgdb_execute(executable_path)`
 - `openmcpgdb_run()`
+- `openmcpgdb_gdbserver(ip, port, pid)`
 - `openmcpgdb_target_remote(ip, port)`
 - `openmcpgdb_set_thread(id)`
 - `openmcpgdb_set_frame(id)`

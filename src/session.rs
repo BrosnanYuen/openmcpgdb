@@ -4,13 +4,15 @@ use crate::{
     gdb::GdbBackend,
     protocol::{CurrentCodePayload, DebuggerResponse, DebuggerState},
 };
-use std::{collections::BTreeMap, path::PathBuf, thread};
+use std::{collections::BTreeMap, path::PathBuf, process::Stdio, thread};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::{Duration, sleep};
 
 #[derive(Debug)]
 pub enum ToolOperation {
     Execute { executable_path: String },
     Run,
+    GdbServer { ip: String, port: u16, pid: i64 },
     TargetRemote { ip: String, port: u16 },
     SetThread { id: i64 },
     SetFrame { id: i64 },
@@ -97,6 +99,7 @@ pub fn spawn_session_thread(
                     }
                 }
             }
+            let _ = core.shutdown().await;
             let _ = backend.stop().await;
         });
     });
@@ -110,6 +113,7 @@ struct SessionCore<'a> {
     debugger_state: DebuggerState,
     watched_variables: Vec<String>,
     executable_path: Option<PathBuf>,
+    gdbserver_child: Option<tokio::process::Child>,
     last_error: String,
 }
 
@@ -121,6 +125,7 @@ impl<'a> SessionCore<'a> {
             debugger_state: DebuggerState::NotAttached,
             watched_variables: Vec::new(),
             executable_path: None,
+            gdbserver_child: None,
             last_error: String::new(),
         }
     }
@@ -138,6 +143,7 @@ impl<'a> SessionCore<'a> {
                 println!("[openmcpgdb_run] requested");
                 self.execute_run().await
             }
+            ToolOperation::GdbServer { ip, port, pid } => self.execute_gdbserver(ip, port, pid).await,
             ToolOperation::TargetRemote { ip, port } => {
                 self.execute_command(
                     &format!("target remote {ip}:{port}"),
@@ -227,6 +233,7 @@ impl<'a> SessionCore<'a> {
                 .execute_command_with_output("info all-registers", None)
                 .await,
             ToolOperation::Quit => {
+                let _ = self.stop_gdbserver_process().await;
                 let _ = self.backend.exec("quit").await;
                 let _ = self.backend.stop().await;
                 self.debugger_state = DebuggerState::NotAttached;
@@ -255,6 +262,10 @@ impl<'a> SessionCore<'a> {
             }
             ToolOperation::Custom { cmd } => self.execute_command(&cmd, None).await,
         }
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        self.stop_gdbserver_process().await
     }
 
     async fn execute_attach(&mut self, executable_path: String) -> Result<DebuggerResponse> {
@@ -364,6 +375,56 @@ impl<'a> SessionCore<'a> {
         }
 
         Ok(response)
+    }
+
+    async fn execute_gdbserver(
+        &mut self,
+        ip: String,
+        port: u16,
+        pid: i64,
+    ) -> Result<DebuggerResponse> {
+        if pid <= 0 {
+            self.debugger_state = DebuggerState::FailedToAttach;
+            self.last_error = "pid must be > 0".to_string();
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
+
+        let _ = self.stop_gdbserver_process().await;
+
+        let endpoint = format!("{ip}:{port}");
+        let mut command = tokio::process::Command::new("gdbserver");
+        command
+            .arg("--attach")
+            .arg(&endpoint)
+            .arg(pid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        let child_result = command.spawn();
+        let mut child = match child_result {
+            Ok(child) => child,
+            Err(err) => {
+                self.debugger_state = DebuggerState::FailedToAttach;
+                self.last_error = format!("failed to start gdbserver: {err}");
+                return Ok(self.base_response().with_error(self.last_error.clone()));
+            }
+        };
+
+        sleep(Duration::from_millis(100)).await;
+        match child.try_wait().map_err(OpenMcpGdbError::Io)? {
+            Some(status) => {
+                self.debugger_state = DebuggerState::FailedToAttach;
+                self.last_error = format!("gdbserver exited early with status: {status}");
+                Ok(self.base_response().with_error(self.last_error.clone()))
+            }
+            None => {
+                self.gdbserver_child = Some(child);
+                self.debugger_state = DebuggerState::GdbServerAttached;
+                self.last_error.clear();
+                Ok(self.base_response())
+            }
+        }
     }
 
     async fn execute_with_full_snapshot(
@@ -623,6 +684,13 @@ impl<'a> SessionCore<'a> {
         self.backend.start(&configured_path).await?;
         self.executable_path = Some(configured_path);
         self.debugger_state = DebuggerState::Attached;
+        Ok(())
+    }
+
+    async fn stop_gdbserver_process(&mut self) -> Result<()> {
+        if let Some(mut child) = self.gdbserver_child.take() {
+            let _ = child.kill().await;
+        }
         Ok(())
     }
 }

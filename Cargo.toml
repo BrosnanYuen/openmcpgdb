@@ -1,6 +1,6 @@
 [package]
 name = "openmcpgdb"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["Brosnan Yuen <brosnanyuen@gmail.com>"]
 description = " Interactive MCP server to control gdb. Fully featured and written in rust "
@@ -9,9 +9,6 @@ repository = "https://github.com/BrosnanYuen/opencodesearch"
 keywords = ["mcp", "claude", "crates", "opencode", "ai"]
 license = "GPL-3.0-only"
 categories = ["development-tools", "web-programming"]
-
-
-
 
 [dependencies]
 anyhow = "1"
