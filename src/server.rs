@@ -451,6 +451,11 @@ mod tests {
             "48\tline48\n49\tline49\n50\tline50\n55\tline55\n",
         );
         handle.set_response("print a", "$1 = 10\n");
+        handle.set_response("info threads", "  Id   Target Id         Frame\n* 1    Thread 0x1 main\n");
+        handle.set_response(
+            "info all-registers",
+            "rax            0x1                 1\nrbx            0x2                 2\n",
+        );
         let factory = Arc::new(MockGdbBackendFactory::new(handle.clone()));
         let server = OpenMcpGdbServer::new(test_config(), factory);
         (server, handle)
@@ -680,5 +685,62 @@ mod tests {
             assert!(text.contains("48 | line48"));
             assert!(text.contains("55 | line55"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_print_info_regs_and_info_threads_return_command_output() {
+        let (server, _) = test_server_with_mock();
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let print_response = server
+            .openmcpgdb_print(Parameters(PrintArgs {
+                var: "a".to_string(),
+                value: None,
+            }))
+            .await
+            .0;
+        assert_eq!(print_response.command_output.as_deref(), Some("$1 = 10"));
+
+        let regs_response = server.openmcpgdb_info_regs().await.0;
+        assert!(
+            regs_response
+                .command_output
+                .as_deref()
+                .map(|value| value.contains("rax") && value.contains("rbx"))
+                .unwrap_or(false)
+        );
+
+        let threads_response = server.openmcpgdb_info_threads().await.0;
+        assert!(
+            threads_response
+                .command_output
+                .as_deref()
+                .map(|value| value.contains("Thread"))
+                .unwrap_or(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_full_backtrace_falls_back_to_plain_backtrace() {
+        let handle = MockBackendHandle::with_default_response("ok");
+        handle.set_response("backtrace full", "");
+        handle.set_response("backtrace", "#0 compute_pi\n#1 run_math\n");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let response = server.openmcpgdb_full_backtrace().await.0;
+        let backtrace = response.backtrace.unwrap_or_default();
+        assert_eq!(backtrace.get("0").map(String::as_str), Some("compute_pi"));
+        assert_eq!(backtrace.get("1").map(String::as_str), Some("run_math"));
     }
 }

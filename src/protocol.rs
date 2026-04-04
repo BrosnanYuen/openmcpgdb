@@ -60,6 +60,8 @@ pub struct DebuggerResponse {
     pub current_code_line: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_code: Option<CurrentCodePayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_output: Option<String>,
     #[serde(default)]
     pub error: String,
 }
@@ -75,6 +77,7 @@ impl DebuggerResponse {
             current_code_path: None,
             current_code_line: None,
             current_code: None,
+            command_output: None,
             error: String::new(),
         }
     }

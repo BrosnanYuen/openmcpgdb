@@ -213,16 +213,19 @@ impl<'a> SessionCore<'a> {
             ToolOperation::VariableList => self.variable_list_response().await,
             ToolOperation::CurrentCode => self.current_code_response().await,
             ToolOperation::FullBacktrace => self.full_backtrace_response().await,
-            ToolOperation::InfoThreads => self.execute_command("info threads", None).await,
+            ToolOperation::InfoThreads => self.execute_command_with_output("info threads", None).await,
             ToolOperation::Print { var, value } => {
-                let cmd = if let Some(value) = value {
-                    format!("set variable {var} = {value}")
+                if let Some(value) = value {
+                    self.execute_command(&format!("set variable {var} = {value}"), None)
+                        .await
                 } else {
-                    format!("print {var}")
-                };
-                self.execute_command(&cmd, None).await
+                    self.execute_command_with_output(&format!("print {var}"), None)
+                        .await
+                }
             }
-            ToolOperation::InfoRegs => self.execute_command("info all-registers", None).await,
+            ToolOperation::InfoRegs => self
+                .execute_command_with_output("info all-registers", None)
+                .await,
             ToolOperation::Quit => {
                 let _ = self.backend.exec("quit").await;
                 let _ = self.backend.stop().await;
@@ -293,6 +296,25 @@ impl<'a> SessionCore<'a> {
         command: &str,
         fallback_state: Option<DebuggerState>,
     ) -> Result<DebuggerResponse> {
+        self.execute_command_internal(command, fallback_state, false)
+            .await
+    }
+
+    async fn execute_command_with_output(
+        &mut self,
+        command: &str,
+        fallback_state: Option<DebuggerState>,
+    ) -> Result<DebuggerResponse> {
+        self.execute_command_internal(command, fallback_state, true)
+            .await
+    }
+
+    async fn execute_command_internal(
+        &mut self,
+        command: &str,
+        fallback_state: Option<DebuggerState>,
+        include_output: bool,
+    ) -> Result<DebuggerResponse> {
         if let Err(err) = self.ensure_backend_started().await {
             self.last_error = err.to_string();
             self.debugger_state = DebuggerState::FailedToAttach;
@@ -314,7 +336,11 @@ impl<'a> SessionCore<'a> {
                         output.trim()
                     );
                 }
-                Ok(self.base_response())
+                let mut response = self.base_response();
+                if include_output {
+                    response.command_output = normalized_command_output(&output);
+                }
+                Ok(response)
             }
             Err(err) => {
                 self.last_error = err.to_string();
@@ -442,36 +468,15 @@ impl<'a> SessionCore<'a> {
         full: bool,
     ) -> Result<(BTreeMap<String, String>, Option<String>)> {
         let command = if full { "backtrace full" } else { "backtrace" };
-        let output = self.backend.exec(command).await.unwrap_or_default();
+        let mut output = self.backend.exec(command).await?;
         let mut backtrace = BTreeMap::new();
+        parse_backtrace_lines(&output, self.config.display_backtrace, &mut backtrace);
 
-        let mut parsed_frames = 0usize;
-        for line in output.lines() {
-            if parsed_frames >= self.config.display_backtrace {
-                break;
-            }
-            let trimmed = line.trim_start();
-            if !trimmed.starts_with('#') {
-                continue;
-            }
-            let mut pieces = trimmed.split_whitespace();
-            let frame = pieces
-                .next()
-                .and_then(|frame| frame.strip_prefix('#'))
-                .unwrap_or("?")
-                .to_string();
-
-            let function = if let Some(index) = trimmed.find(" in ") {
-                trimmed[(index + 4)..]
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("unknown")
-                    .to_string()
-            } else {
-                pieces.next().unwrap_or("unknown").to_string()
-            };
-            backtrace.insert(frame, function);
-            parsed_frames += 1;
+        // Some targets or GDB settings can yield sparse/empty "backtrace full" output.
+        // Fall back to plain backtrace to keep frame info available to MCP clients.
+        if full && backtrace.is_empty() {
+            output = self.backend.exec("backtrace").await?;
+            parse_backtrace_lines(&output, self.config.display_backtrace, &mut backtrace);
         }
 
         let current_func = if let Some(func) = backtrace.get("0") {
@@ -636,6 +641,15 @@ fn normalize_gdb_value(output: &str) -> String {
     String::new()
 }
 
+fn normalized_command_output(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn parse_path_and_line(frame_output: &str) -> (Option<String>, Option<u64>) {
     for line in frame_output.lines() {
         if let Some(at_idx) = line.find(" at ") {
@@ -673,9 +687,54 @@ fn parse_gdb_list_line(line: &str) -> Option<(u64, &str)> {
     Some((number, source))
 }
 
+fn parse_backtrace_lines(output: &str, limit: usize, backtrace: &mut BTreeMap<String, String>) {
+    for line in output.lines() {
+        if backtrace.len() >= limit {
+            break;
+        }
+        if let Some((frame_number, function)) = parse_backtrace_frame_line(line) {
+            backtrace.insert(frame_number.to_string(), function);
+        }
+    }
+}
+
+fn parse_backtrace_frame_line(line: &str) -> Option<(u64, String)> {
+    let hash_idx = line.find('#')?;
+    let frame_section = &line[(hash_idx + 1)..];
+    let digits_len = frame_section
+        .chars()
+        .take_while(|char| char.is_ascii_digit())
+        .count();
+    if digits_len == 0 {
+        return None;
+    }
+
+    let frame_number = frame_section[..digits_len].parse::<u64>().ok()?;
+    let mut rest = frame_section[digits_len..].trim_start();
+
+    if let Some(index) = rest.find(" in ") {
+        rest = &rest[(index + 4)..];
+    } else if let Some(stripped) = rest.strip_prefix("in ") {
+        rest = stripped;
+    }
+
+    let mut function = rest.split_whitespace().next().unwrap_or("unknown");
+    if function == "in" {
+        function = rest
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("unknown");
+    }
+    if let Some((name, _)) = function.split_once('(') {
+        function = name;
+    }
+
+    Some((frame_number, function.to_string()))
+}
+
 #[cfg(test)]
 mod parse_tests {
-    use super::parse_gdb_list_line;
+    use super::{parse_backtrace_frame_line, parse_gdb_list_line};
 
     #[test]
     fn test_parse_gdb_list_line_preserves_space_indentation() {
@@ -693,5 +752,16 @@ mod parse_tests {
         let (line_no, source) = parsed.expect("parsed line");
         assert_eq!(line_no, 24);
         assert_eq!(source, "\trobot_init(&g_robot, &g_sim);");
+    }
+
+    #[test]
+    fn test_parse_backtrace_frame_line_with_address_and_in() {
+        let parsed = parse_backtrace_frame_line(
+            "#0  0x00005555555551cb in compute_pi (value=3) at /tmp/main.c:55",
+        );
+        assert!(parsed.is_some(), "frame should parse");
+        let (frame_no, function) = parsed.expect("parsed frame");
+        assert_eq!(frame_no, 0);
+        assert_eq!(function, "compute_pi");
     }
 }
