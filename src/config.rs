@@ -28,7 +28,7 @@ fn default_server_name() -> String {
 }
 
 fn default_server_url() -> String {
-    "stdio://local".to_string()
+    "https://localhost:9443".to_string()
 }
 
 fn default_lines_before() -> usize {

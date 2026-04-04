@@ -10,8 +10,8 @@ It is implemented with the `rmcp` crate and exposes a full `openmcpgdb_*` tool A
 - GDB process isolation per client.
 - Configurable display windows for source, backtrace, and watched variables.
 - Transport modes:
-  - `stdio://...` (recommended for CLI MCP clients)
-  - `http://...` and `https://...` URL parsing support for streamable HTTP mode
+  - `https://...` and `http://...` streamable HTTP mode (default)
+  - `stdio://...` for stdio MCP wiring when needed
 - Interactive MCP test client binary included.
 - Rust tests include:
   - in-process MCP server/client connectivity
@@ -50,7 +50,7 @@ Example:
   "codebase_dir": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot",
   "executable_path": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot",
   "mcp_server_name": "MCP GDB Server",
-  "mcp_server_url": "stdio://local",
+  "mcp_server_url": "https://localhost:9443",
   "display_lines_before_current": 7,
   "display_lines_after_current": 8,
   "display_backtrace": 6,
@@ -60,8 +60,9 @@ Example:
 
 ### `mcp_server_url`
 
-- `stdio://...`: run MCP over stdio.
+- Default: `https://localhost:9443`
 - `http://host:port/path` or `https://host:port/path`: run streamable HTTP on that bind address/path.
+- `stdio://...`: run MCP over stdio.
 
 Note: `https://` is parsed and accepted, but this project currently binds plain TCP HTTP directly. For real TLS, run behind a TLS-terminating reverse proxy.
 
@@ -73,20 +74,34 @@ cargo build
 
 ## Run the MCP Server
 
-### 1. Stdio mode (recommended for MCP CLI clients)
+### 1. Default HTTPS URL mode
 
-Set `mcp_server_url` in config to `stdio://local`, then run:
+Use default config:
 
 ```bash
 cargo run -- config.json
 ```
 
-### 2. HTTP mode
+### 2. HTTP/HTTPS custom URL mode
 
 Set config URL, for example:
 
 ```json
-"mcp_server_url": "http://127.0.0.1:9443/mcp"
+"mcp_server_url": "https://localhost:9443"
+```
+
+Run:
+
+```bash
+cargo run -- config.json
+```
+
+### 3. Optional stdio mode
+
+Set:
+
+```json
+"mcp_server_url": "stdio://local"
 ```
 
 Run:
@@ -102,7 +117,7 @@ An interactive MCP client is included for manual testing against HTTP server mod
 Run:
 
 ```bash
-cargo run --bin interactive_client -- http://127.0.0.1:9443/mcp
+cargo run --bin interactive_client -- https://localhost:9443
 ```
 
 Input format:

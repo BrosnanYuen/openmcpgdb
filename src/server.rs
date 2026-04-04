@@ -412,7 +412,7 @@ mod tests {
             codebase_dir: "/tmp".into(),
             executable_path: "/tmp/exe".into(),
             mcp_server_name: "MCP GDB Server".to_string(),
-            mcp_server_url: "stdio://local".to_string(),
+            mcp_server_url: "https://localhost:9443".to_string(),
             display_lines_before_current: 7,
             display_lines_after_current: 8,
             display_backtrace: 6,

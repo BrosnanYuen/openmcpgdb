@@ -5,7 +5,7 @@ use std::io::{self, Write};
 async fn main() -> anyhow::Result<()> {
     let url = std::env::args()
         .nth(1)
-        .unwrap_or_else(|| "http://127.0.0.1:9443/mcp".to_string());
+        .unwrap_or_else(|| "https://localhost:9443".to_string());
 
     let transport = StreamableHttpClientTransport::from_uri(url);
     let client = ().serve(transport).await?;
