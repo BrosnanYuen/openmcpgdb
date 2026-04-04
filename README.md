@@ -54,9 +54,14 @@ Example:
   "display_lines_before_current": 7,
   "display_lines_after_current": 8,
   "display_backtrace": 6,
-  "display_variable_list": 9
+  "display_variable_list": 9,
+  "display_join_current_code": true
 }
 ```
+
+`display_join_current_code` controls how `current_code` is returned:
+- `false`: object map keyed by line number
+- `true`: single joined string in the format `line | source` with newline separators
 
 ### `mcp_server_url`
 

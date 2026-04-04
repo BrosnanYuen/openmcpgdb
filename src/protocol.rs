@@ -37,10 +37,19 @@ pub enum DebuggerState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum CurrentCodePayload {
+    Lines(BTreeMap<u64, String>),
+    Joined(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct DebuggerResponse {
     pub debugger_state: DebuggerState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variable_list: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breakpoints: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backtrace: Option<BTreeMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -50,7 +59,7 @@ pub struct DebuggerResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_code_line: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_code: Option<BTreeMap<String, String>>,
+    pub current_code: Option<CurrentCodePayload>,
     #[serde(default)]
     pub error: String,
 }
@@ -60,6 +69,7 @@ impl DebuggerResponse {
         Self {
             debugger_state,
             variable_list: None,
+            breakpoints: None,
             backtrace: None,
             current_func: None,
             current_code_path: None,

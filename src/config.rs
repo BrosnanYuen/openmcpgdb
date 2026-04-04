@@ -21,6 +21,8 @@ pub struct ServerConfig {
     pub display_backtrace: usize,
     #[serde(default = "default_variable_list")]
     pub display_variable_list: usize,
+    #[serde(default)]
+    pub display_join_current_code: bool,
 }
 
 fn default_server_name() -> String {

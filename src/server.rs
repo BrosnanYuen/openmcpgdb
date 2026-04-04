@@ -397,7 +397,7 @@ mod tests {
     use super::*;
     use crate::{
         gdb::{MockBackendHandle, MockGdbBackendFactory},
-        protocol::DebuggerState,
+        protocol::{CurrentCodePayload, DebuggerState},
     };
     use anyhow::Result;
     use rmcp::{
@@ -417,6 +417,7 @@ mod tests {
             display_lines_after_current: 8,
             display_backtrace: 6,
             display_variable_list: 9,
+            display_join_current_code: false,
         }
     }
 
@@ -432,6 +433,21 @@ mod tests {
         let factory = Arc::new(MockGdbBackendFactory::new(handle.clone()));
         let server = OpenMcpGdbServer::new(test_config(), factory);
         (server, handle)
+    }
+
+    fn test_server_with_mock_joined_code() -> OpenMcpGdbServer {
+        let mut config = test_config();
+        config.display_join_current_code = true;
+
+        let handle = MockBackendHandle::with_default_response("Breakpoint 1 at 0x0");
+        handle.set_response("backtrace full", "#0 compute_pi\n#1 run_math\n#2 main\n");
+        handle.set_response("frame", "#0 compute_pi at /tmp/main.c:55\n");
+        handle.set_response(
+            "list 48,63",
+            "48\tline48\n49\tline49\n50\tline50\n55\tline55\n",
+        );
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        OpenMcpGdbServer::new(config, factory)
     }
 
     #[tokio::test]
@@ -615,5 +631,26 @@ mod tests {
         client.cancel().await?;
         let _ = server_task.await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_joined_current_code_response() {
+        let server = test_server_with_mock_joined_code();
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let response = server.openmcpgdb_next().await.0;
+        assert!(matches!(
+            response.current_code.as_ref(),
+            Some(CurrentCodePayload::Joined(_))
+        ));
+
+        if let Some(CurrentCodePayload::Joined(text)) = response.current_code.as_ref() {
+            assert!(text.contains("48 | line48"));
+            assert!(text.contains("55 | line55"));
+        }
     }
 }

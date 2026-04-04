@@ -2,7 +2,7 @@ use crate::{
     config::ServerConfig,
     error::{OpenMcpGdbError, Result},
     gdb::GdbBackend,
-    protocol::{DebuggerResponse, DebuggerState},
+    protocol::{CurrentCodePayload, DebuggerResponse, DebuggerState},
 };
 use std::{collections::BTreeMap, path::PathBuf, thread};
 use tokio::sync::{mpsc, oneshot};
@@ -136,8 +136,7 @@ impl<'a> SessionCore<'a> {
             }
             ToolOperation::Run => {
                 println!("[openmcpgdb_run] requested");
-                self.execute_command("run", Some(DebuggerState::Running))
-                    .await
+                self.execute_run().await
             }
             ToolOperation::TargetRemote { ip, port } => {
                 self.execute_command(
@@ -183,7 +182,7 @@ impl<'a> SessionCore<'a> {
                 self.execute_command(&format!("disable location {filename}:{linenumber}"), None)
                     .await
             }
-            ToolOperation::ListBreakpoint => self.execute_command("info breakpoints", None).await,
+            ToolOperation::ListBreakpoint => self.list_breakpoint_response().await,
             ToolOperation::Next => {
                 self.execute_with_full_snapshot("next", DebuggerState::StoppedAtBreakpoint)
                     .await
@@ -328,12 +327,29 @@ impl<'a> SessionCore<'a> {
         }
     }
 
+    async fn execute_run(&mut self) -> Result<DebuggerResponse> {
+        let response = self
+            .execute_command("run", Some(DebuggerState::Running))
+            .await?;
+
+        // Per spec, when run stops at a breakpoint, return the full normal response.
+        if response.debugger_state == DebuggerState::StoppedAtBreakpoint {
+            return self.full_snapshot_response().await;
+        }
+
+        Ok(response)
+    }
+
     async fn execute_with_full_snapshot(
         &mut self,
         command: &str,
         fallback_state: DebuggerState,
     ) -> Result<DebuggerResponse> {
         let _ = self.execute_command(command, Some(fallback_state)).await?;
+        self.full_snapshot_response().await
+    }
+
+    async fn full_snapshot_response(&mut self) -> Result<DebuggerResponse> {
         let mut response = self.base_response();
         response.variable_list = Some(self.collect_variable_list().await?);
         let (backtrace, current_func) = self.collect_backtrace(true).await?;
@@ -342,7 +358,7 @@ impl<'a> SessionCore<'a> {
         let code = self.collect_current_code().await?;
         response.current_code_path = code.0;
         response.current_code_line = code.1;
-        response.current_code = code.2;
+        response.current_code = code.2.map(|lines| self.transform_current_code(lines));
         Ok(response)
     }
 
@@ -360,12 +376,41 @@ impl<'a> SessionCore<'a> {
         Ok(response)
     }
 
+    async fn list_breakpoint_response(&mut self) -> Result<DebuggerResponse> {
+        if let Err(err) = self.ensure_backend_started().await {
+            self.last_error = err.to_string();
+            self.debugger_state = DebuggerState::FailedToAttach;
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
+
+        let output = self.backend.exec("info breakpoints").await;
+        match output {
+            Ok(output) => {
+                let lines: Vec<String> = output
+                    .lines()
+                    .map(str::trim_end)
+                    .filter(|line| !line.is_empty())
+                    .map(ToString::to_string)
+                    .collect();
+
+                let mut response = self.base_response();
+                response.breakpoints = Some(lines);
+                Ok(response)
+            }
+            Err(err) => {
+                self.last_error = err.to_string();
+                self.debugger_state = DebuggerState::Error;
+                Ok(self.base_response().with_error(self.last_error.clone()))
+            }
+        }
+    }
+
     async fn current_code_response(&mut self) -> Result<DebuggerResponse> {
         let mut response = self.base_response();
         let code = self.collect_current_code().await?;
         response.current_code_path = code.0;
         response.current_code_line = code.1;
-        response.current_code = code.2;
+        response.current_code = code.2.map(|lines| self.transform_current_code(lines));
         Ok(response)
     }
 
@@ -400,7 +445,11 @@ impl<'a> SessionCore<'a> {
         let output = self.backend.exec(command).await.unwrap_or_default();
         let mut backtrace = BTreeMap::new();
 
-        for line in output.lines().take(self.config.display_backtrace) {
+        let mut parsed_frames = 0usize;
+        for line in output.lines() {
+            if parsed_frames >= self.config.display_backtrace {
+                break;
+            }
             let trimmed = line.trim_start();
             if !trimmed.starts_with('#') {
                 continue;
@@ -422,9 +471,26 @@ impl<'a> SessionCore<'a> {
                 pieces.next().unwrap_or("unknown").to_string()
             };
             backtrace.insert(frame, function);
+            parsed_frames += 1;
         }
 
-        let current_func = backtrace.get("0").cloned();
+        let current_func = if let Some(func) = backtrace.get("0") {
+            Some(func.clone())
+        } else {
+            let mut best: Option<(u64, String)> = None;
+            for (frame_key, func) in &backtrace {
+                if let Ok(frame_num) = frame_key.parse::<u64>() {
+                    match &best {
+                        Some((best_num, _)) if frame_num >= *best_num => {}
+                        _ => {
+                            best = Some((frame_num, func.clone()));
+                        }
+                    }
+                }
+            }
+            best.map(|(_, func)| func)
+                .or_else(|| backtrace.values().next().cloned())
+        };
         Ok((backtrace, current_func))
     }
 
@@ -433,7 +499,7 @@ impl<'a> SessionCore<'a> {
     ) -> Result<(
         Option<String>,
         Option<u64>,
-        Option<BTreeMap<String, String>>,
+        Option<BTreeMap<u64, String>>,
     )> {
         let frame = self.backend.exec("frame").await.unwrap_or_default();
         let (path, line) = parse_path_and_line(&frame);
@@ -451,7 +517,7 @@ impl<'a> SessionCore<'a> {
                 .unwrap_or_default();
             for raw_line in list_output.lines() {
                 if let Some((number, source)) = parse_gdb_list_line(raw_line) {
-                    code_lines.insert(number.to_string(), source.to_string());
+                    code_lines.insert(number, source.to_string());
                 }
             }
         }
@@ -517,6 +583,23 @@ impl<'a> SessionCore<'a> {
         }
         if let Some(state) = fallback_state {
             self.debugger_state = state;
+        }
+    }
+
+    fn transform_current_code(&self, lines: BTreeMap<u64, String>) -> CurrentCodePayload {
+        if self.config.display_join_current_code {
+            let mut joined = String::new();
+            let mut first = true;
+            for (line_no, source) in lines {
+                if !first {
+                    joined.push('\n');
+                }
+                first = false;
+                joined.push_str(&format!("{line_no} | {source}"));
+            }
+            CurrentCodePayload::Joined(joined)
+        } else {
+            CurrentCodePayload::Lines(lines)
         }
     }
 

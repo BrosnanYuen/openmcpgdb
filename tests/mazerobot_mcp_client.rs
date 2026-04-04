@@ -34,6 +34,7 @@ fn mazerobot_config() -> ServerConfig {
         display_lines_after_current: 8,
         display_backtrace: 6,
         display_variable_list: 9,
+        display_join_current_code: false,
     }
 }
 
