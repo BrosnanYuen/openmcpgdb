@@ -1,0 +1,265 @@
+use crate::{
+    config::ServerConfig,
+    error::{OpenMcpGdbError, Result},
+};
+use async_trait::async_trait;
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStdin, ChildStdout, Command},
+};
+
+#[async_trait]
+pub trait GdbBackend: Send + Sync {
+    async fn start(&mut self, executable_path: &Path) -> Result<()>;
+    async fn exec(&mut self, command: &str) -> Result<String>;
+    async fn stop(&mut self) -> Result<()>;
+}
+
+pub trait GdbBackendFactory: Send + Sync {
+    fn create(&self, config: &ServerConfig) -> Box<dyn GdbBackend>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RealGdbBackendFactory;
+
+impl GdbBackendFactory for RealGdbBackendFactory {
+    fn create(&self, config: &ServerConfig) -> Box<dyn GdbBackend> {
+        Box::new(RealGdbBackend::new(config.clone()))
+    }
+}
+
+pub struct RealGdbBackend {
+    config: ServerConfig,
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    stdout: Option<BufReader<ChildStdout>>,
+}
+
+impl RealGdbBackend {
+    pub fn new(config: ServerConfig) -> Self {
+        Self {
+            config,
+            child: None,
+            stdin: None,
+            stdout: None,
+        }
+    }
+
+    fn ensure_started(&self) -> Result<()> {
+        if self.child.is_none() {
+            return Err(OpenMcpGdbError::Gdb(
+                "gdb process not started, call openmcpgdb_execute first".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl GdbBackend for RealGdbBackend {
+    async fn start(&mut self, executable_path: &Path) -> Result<()> {
+        // If gdb is already running, stop it first before starting a new target.
+        if self.child.is_some() {
+            self.stop().await?;
+        }
+
+        // Build the process command from configured gdb binary and options.
+        let mut command = Command::new(&self.config.gdb_path);
+        for option in self.config.gdb_options.split_whitespace() {
+            command.arg(option);
+        }
+        command
+            .arg(executable_path)
+            .arg("--quiet")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        // Spawn gdb and extract piped streams used for command/response exchange.
+        let mut child = command.spawn().map_err(OpenMcpGdbError::Io)?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| OpenMcpGdbError::Gdb("failed to get gdb stdin".to_string()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| OpenMcpGdbError::Gdb("failed to get gdb stdout".to_string()))?;
+
+        self.stdin = Some(stdin);
+        self.stdout = Some(BufReader::new(stdout));
+        self.child = Some(child);
+        Ok(())
+    }
+
+    async fn exec(&mut self, command: &str) -> Result<String> {
+        self.ensure_started()?;
+
+        // Send the user command and append a sentinel printf to delimit the response.
+        let marker = "__OPENMCPGDB_DONE__";
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| OpenMcpGdbError::Gdb("gdb stdin unavailable".to_string()))?;
+        stdin
+            .write_all(format!("{command}\n").as_bytes())
+            .await
+            .map_err(OpenMcpGdbError::Io)?;
+        stdin
+            .write_all(format!("printf \"{marker}\\n\"\n").as_bytes())
+            .await
+            .map_err(OpenMcpGdbError::Io)?;
+        stdin.flush().await.map_err(OpenMcpGdbError::Io)?;
+
+        // Drain gdb output lines until the sentinel is observed.
+        let mut output = String::new();
+        let stdout = self
+            .stdout
+            .as_mut()
+            .ok_or_else(|| OpenMcpGdbError::Gdb("gdb stdout unavailable".to_string()))?;
+        loop {
+            let mut line = String::new();
+            let count = stdout
+                .read_line(&mut line)
+                .await
+                .map_err(OpenMcpGdbError::Io)?;
+            if count == 0 {
+                break;
+            }
+            if line.contains(marker) {
+                break;
+            }
+            output.push_str(&line);
+        }
+
+        Ok(output)
+    }
+
+    async fn stop(&mut self) -> Result<()> {
+        if self.child.is_some() {
+            // Best effort graceful shutdown by asking gdb to quit first.
+            if let Some(stdin) = self.stdin.as_mut() {
+                let _ = stdin.write_all(b"quit\ny\n").await;
+                let _ = stdin.flush().await;
+            }
+            if let Some(child) = self.child.as_mut() {
+                let _ = child.kill().await;
+            }
+        }
+
+        self.child = None;
+        self.stdin = None;
+        self.stdout = None;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct MockBackendHandle {
+    inner: Arc<Mutex<MockBackendState>>,
+}
+
+#[derive(Default)]
+struct MockBackendState {
+    pub started: bool,
+    pub commands: Vec<String>,
+    pub responses: HashMap<String, String>,
+    pub default_response: String,
+}
+
+impl MockBackendHandle {
+    pub fn with_default_response(response: impl Into<String>) -> Self {
+        let handle = Self::default();
+        if let Ok(mut state) = handle.inner.lock() {
+            state.default_response = response.into();
+        }
+        handle
+    }
+
+    pub fn set_response(&self, command: &str, response: &str) {
+        if let Ok(mut state) = self.inner.lock() {
+            state
+                .responses
+                .insert(command.to_string(), response.to_string());
+        }
+    }
+
+    pub fn commands(&self) -> Vec<String> {
+        if let Ok(state) = self.inner.lock() {
+            return state.commands.clone();
+        }
+        Vec::new()
+    }
+}
+
+pub struct MockGdbBackend {
+    handle: MockBackendHandle,
+}
+
+impl MockGdbBackend {
+    pub fn new(handle: MockBackendHandle) -> Self {
+        Self { handle }
+    }
+}
+
+#[async_trait]
+impl GdbBackend for MockGdbBackend {
+    async fn start(&mut self, _executable_path: &Path) -> Result<()> {
+        let mut state = self
+            .handle
+            .inner
+            .lock()
+            .map_err(|_| OpenMcpGdbError::Worker("mock backend poisoned".to_string()))?;
+        state.started = true;
+        Ok(())
+    }
+
+    async fn exec(&mut self, command: &str) -> Result<String> {
+        let mut state = self
+            .handle
+            .inner
+            .lock()
+            .map_err(|_| OpenMcpGdbError::Worker("mock backend poisoned".to_string()))?;
+        state.commands.push(command.to_string());
+        if let Some(value) = state.responses.get(command) {
+            return Ok(value.clone());
+        }
+        Ok(state.default_response.clone())
+    }
+
+    async fn stop(&mut self) -> Result<()> {
+        let mut state = self
+            .handle
+            .inner
+            .lock()
+            .map_err(|_| OpenMcpGdbError::Worker("mock backend poisoned".to_string()))?;
+        state.started = false;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct MockGdbBackendFactory {
+    handle: MockBackendHandle,
+}
+
+impl MockGdbBackendFactory {
+    pub fn new(handle: MockBackendHandle) -> Self {
+        Self { handle }
+    }
+
+    pub fn handle(&self) -> MockBackendHandle {
+        self.handle.clone()
+    }
+}
+
+impl GdbBackendFactory for MockGdbBackendFactory {
+    fn create(&self, _config: &ServerConfig) -> Box<dyn GdbBackend> {
+        Box::new(MockGdbBackend::new(self.handle.clone()))
+    }
+}
