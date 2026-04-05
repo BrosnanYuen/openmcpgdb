@@ -18,6 +18,55 @@ It is implemented with the `rmcp` crate and exposes a full `gdb_*` tool API for 
   - tool-call coverage
   - integration test against `examples/mazerobot/maze_robot`
 
+## Quick Start 
+
+1. Download and Run
+
+```bash
+git clone https://github.com/BrosnanYuen/openmcpgdb.git
+cd openmcpgdb
+# Change the settings to point to your codebase and executable
+# Use HTTP for server compatibility 
+vim config.json
+# Run MCP server
+cargo run --bin  openmcpgdb  -- config.json 
+```
+
+2. Add to Claude Code `claude.json`
+```json
+{
+  "mcpServers": {
+    "openmcpgdb": {
+      "type": "http",
+      "url": "http://localhost:9443"
+    }
+  }
+}
+```
+
+3. Add to Openai Codex `config.toml` config
+```
+[mcp_servers.openmcpgdb]
+url = "http://localhost:9443"
+enabled = true
+```
+
+4. Add to `opencode.json` config
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "openmcpgdb": {
+      "type": "remote",
+      "url": "http://localhost:9443",
+      "enabled": true
+    }
+  }
+}
+```
+
+5. Give [LLM.md](LLM.md ) to your LLM
+
 ## Requirements
 
 - Rust toolchain (stable)
@@ -84,7 +133,7 @@ cargo build
 Use default config:
 
 ```bash
-cargo run -- config.json
+cargo run --bin openmcpgdb -- config.json
 ```
 
 ### 2. HTTP/HTTPS custom URL mode
@@ -98,7 +147,7 @@ Set config URL, for example:
 Run:
 
 ```bash
-cargo run -- config.json
+cargo run --bin openmcpgdb -- config.json
 ```
 
 ### 3. Optional stdio mode
@@ -112,7 +161,7 @@ Set:
 Run:
 
 ```bash
-cargo run -- config.json
+cargo run --bin openmcpgdb -- config.json
 ```
 
 ## Interactive MCP Client
@@ -122,7 +171,7 @@ An interactive MCP client is included for manual testing against HTTP server mod
 Run:
 
 ```bash
-cargo run --bin interactive_client -- https://localhost:9443
+cargo run --bin interactive_client -- config.json
 ```
 
 Input format:
@@ -327,19 +376,3 @@ Included test coverage:
   - binary: `/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot`
   - MCP client in `tests/mazerobot_mcp_client.rs`
 
-## Quick Start (Mazerobot)
-
-1. Ensure binary exists:
-
-```bash
-ls -l /home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot
-```
-
-2. Set `config.json` for mazerobot absolute paths.
-3. Start server:
-
-```bash
-cargo run -- config.json
-```
-
-4. In another terminal (HTTP mode), run interactive client and call tools.
