@@ -103,7 +103,7 @@ async fn main() -> anyhow::Result<()> {
 
     println!("interactive MCP client ready");
     println!("use: <tool_name> <json-object-args>");
-    println!("example: openmcpgdb_debugger_state {{}}");
+    println!("example: gdb_debugger_state {{}}");
     println!("type 'quit' to exit");
 
     loop {

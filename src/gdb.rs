@@ -7,11 +7,12 @@ use std::{
     collections::HashMap,
     path::Path,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    time::timeout,
 };
 
 #[async_trait]
@@ -41,6 +42,7 @@ pub struct RealGdbBackend {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stdout: Option<BufReader<ChildStdout>>,
+    stderr: Option<ChildStderr>,
 }
 
 impl RealGdbBackend {
@@ -50,13 +52,14 @@ impl RealGdbBackend {
             child: None,
             stdin: None,
             stdout: None,
+            stderr: None,
         }
     }
 
     fn ensure_started(&self) -> Result<()> {
         if self.child.is_none() {
             return Err(OpenMcpGdbError::Gdb(
-                "gdb process not started, call openmcpgdb_execute first".to_string(),
+                "gdb process not started, call gdb_execute first".to_string(),
             ));
         }
         Ok(())
@@ -93,10 +96,22 @@ impl GdbBackend for RealGdbBackend {
             .stdout
             .take()
             .ok_or_else(|| OpenMcpGdbError::Gdb("failed to get gdb stdout".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| OpenMcpGdbError::Gdb("failed to get gdb stderr".to_string()))?;
 
         self.stdin = Some(stdin);
         self.stdout = Some(BufReader::new(stdout));
+        self.stderr = Some(stderr);
         self.child = Some(child);
+
+        // Normalize gdb behavior for stable machine-driven command parsing.
+        let _ = self.exec("set pagination off").await;
+        let _ = self.exec("set confirm off").await;
+        // Route inferior stdout/stderr away from gdb console to avoid mixing tool responses
+        // with target program output.
+        let _ = self.exec("set inferior-tty /dev/null").await;
         Ok(())
     }
 
@@ -120,17 +135,29 @@ impl GdbBackend for RealGdbBackend {
         stdin.flush().await.map_err(OpenMcpGdbError::Io)?;
 
         // Drain gdb output lines until the sentinel is observed.
+        // Some commands (notably `continue`) may not promptly return to the prompt,
+        // so we use a bounded wait and fall back to state inference.
+        let command_timeout = Duration::from_secs(3);
+        let command_start = Instant::now();
         let mut output = String::new();
         let stdout = self
             .stdout
             .as_mut()
             .ok_or_else(|| OpenMcpGdbError::Gdb("gdb stdout unavailable".to_string()))?;
         loop {
+            let elapsed = command_start.elapsed();
+            if elapsed >= command_timeout {
+                break;
+            }
+
             let mut line = String::new();
-            let count = stdout
-                .read_line(&mut line)
-                .await
-                .map_err(OpenMcpGdbError::Io)?;
+            let remaining = command_timeout
+                .checked_sub(elapsed)
+                .unwrap_or(Duration::from_millis(1));
+            let count = match timeout(remaining, stdout.read_line(&mut line)).await {
+                Ok(result) => result.map_err(OpenMcpGdbError::Io)?,
+                Err(_) => break,
+            };
             if count == 0 {
                 break;
             }
@@ -138,6 +165,24 @@ impl GdbBackend for RealGdbBackend {
                 break;
             }
             output.push_str(&line);
+        }
+
+        // Collect available stderr output to preserve command failures that GDB emits on stderr.
+        if let Some(stderr) = self.stderr.as_mut() {
+            loop {
+                let mut buf = [0u8; 1024];
+                match timeout(Duration::from_millis(20), stderr.read(&mut buf)).await {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(count)) => {
+                        output.push_str(&String::from_utf8_lossy(&buf[..count]));
+                        if count < buf.len() {
+                            break;
+                        }
+                    }
+                    Ok(Err(err)) => return Err(OpenMcpGdbError::Io(err)),
+                    Err(_) => break,
+                }
+            }
         }
 
         Ok(output)
@@ -158,6 +203,7 @@ impl GdbBackend for RealGdbBackend {
         self.child = None;
         self.stdin = None;
         self.stdout = None;
+        self.stderr = None;
         Ok(())
     }
 
@@ -185,6 +231,7 @@ struct MockBackendState {
     pub started: bool,
     pub commands: Vec<String>,
     pub responses: HashMap<String, String>,
+    pub errors: HashMap<String, String>,
     pub default_response: String,
 }
 
@@ -202,6 +249,14 @@ impl MockBackendHandle {
             state
                 .responses
                 .insert(command.to_string(), response.to_string());
+        }
+    }
+
+    pub fn set_error(&self, command: &str, error: &str) {
+        if let Ok(mut state) = self.inner.lock() {
+            state
+                .errors
+                .insert(command.to_string(), error.to_string());
         }
     }
 
@@ -242,6 +297,9 @@ impl GdbBackend for MockGdbBackend {
             .lock()
             .map_err(|_| OpenMcpGdbError::Worker("mock backend poisoned".to_string()))?;
         state.commands.push(command.to_string());
+        if let Some(error) = state.errors.get(command) {
+            return Err(OpenMcpGdbError::Gdb(error.clone()));
+        }
         if let Some(value) = state.responses.get(command) {
             return Ok(value.clone());
         }

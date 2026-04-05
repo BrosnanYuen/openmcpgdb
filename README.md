@@ -1,7 +1,7 @@
 # openmcpgdb
 
 `openmcpgdb` is an asynchronous Rust MCP server for debugging native programs through GDB.
-It is implemented with the `rmcp` crate and exposes a full `openmcpgdb_*` tool API for MCP clients (Codex, Claude Code, opencode-compatible clients).
+It is implemented with the `rmcp` crate and exposes a full `gdb_*` tool API for MCP clients (Codex, Claude Code, opencode-compatible clients).
 
 ## Features
 
@@ -134,33 +134,35 @@ Input format:
 Examples of Debugging on local GDB:
 
 ```text
-openmcpgdb_execute {"executable_path":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot"}
-openmcpgdb_debugger_state {}
-openmcpgdb_add_variable_list {"var":"robot_state"}
-openmcpgdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c","linenumber":20}
-openmcpgdb_run {}
-openmcpgdb_next {}
-openmcpgdb_step {}
-openmcpgdb_print {"var":"counter"}
-openmcpgdb_full_backtrace {}
-openmcpgdb_continue {}
-openmcpgdb_quit {}
+gdb_execute {"executable_path":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot"}
+gdb_debugger_state {}
+gdb_add_variable_list {"var":"robot_state"}
+gdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c","linenumber":20}
+gdb_run {}
+gdb_next {}
+gdb_step {}
+gdb_print {"var":"counter"}
+gdb_full_backtrace {}
+gdb_continue {}
+gdb_reset_back_to_not_attached {}
+gdb_quit {}
 ```
 
 Examples of Debugging on gdbserver on exsisting PID:
 ```
-openmcpgdb_gdbserver {"ip":"127.0.0.1","port":11234,"pid":12345}
-openmcpgdb_target_remote {"ip":"127.0.0.1","port":11234}
-openmcpgdb_debugger_state {}
-openmcpgdb_add_variable_list {"var":"robot_state"}
-openmcpgdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c","linenumber":20}
-openmcpgdb_run {}
-openmcpgdb_next {}
-openmcpgdb_step {}
-openmcpgdb_print {"var":"counter"}
-openmcpgdb_full_backtrace {}
-openmcpgdb_continue {}
-openmcpgdb_quit {}
+gdb_gdbserver {"ip":"127.0.0.1","port":11234,"pid":12345}
+gdb_target_remote {"ip":"127.0.0.1","port":11234}
+gdb_debugger_state {}
+gdb_add_variable_list {"var":"robot_state"}
+gdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c","linenumber":20}
+gdb_run {}
+gdb_next {}
+gdb_step {}
+gdb_print {"var":"counter"}
+gdb_full_backtrace {}
+gdb_continue {}
+gdb_reset_back_to_not_attached {}
+gdb_quit {}
 ```
 
 Type `quit` to exit the interactive client.
@@ -260,52 +262,53 @@ All tool responses include `debugger_state` and optional fields like `variable_l
 
 ### Execution/session
 
-- `openmcpgdb_execute(executable_path)`
-- `openmcpgdb_run()`
-- `openmcpgdb_gdbserver(ip, port, pid)`
-- `openmcpgdb_target_remote(ip, port)`
-- `openmcpgdb_set_thread(id)`
-- `openmcpgdb_set_frame(id)`
+- `gdb_execute(executable_path)`
+- `gdb_run()`
+- `gdb_gdbserver(ip, port, pid)`
+- `gdb_target_remote(ip, port)`
+- `gdb_set_thread(id)`
+- `gdb_set_frame(id)`
 
 ### Breakpoints
 
-- `openmcpgdb_add_breakpoint(filename, linenumber)`
-- `openmcpgdb_clear_breakpoint(filename, linenumber)`
-- `openmcpgdb_enable_breakpoint(filename, linenumber)`
-- `openmcpgdb_disable_breakpoint(filename, linenumber)`
-- `openmcpgdb_list_breakpoint()`
+- `gdb_add_breakpoint(filename, linenumber)`
+- `gdb_clear_breakpoint(filename, linenumber)`
+- `gdb_enable_breakpoint(filename, linenumber)`
+- `gdb_disable_breakpoint(filename, linenumber)`
+- `gdb_list_breakpoint()`
 
 ### Stepping
 
-- `openmcpgdb_next()`
-- `openmcpgdb_step()`
-- `openmcpgdb_continue()`
+- `gdb_next()`
+- `gdb_step()`
+- `gdb_continue()`
 
 ### Variable watch list
 
-- `openmcpgdb_add_variable_list(var)`
-- `openmcpgdb_del_variable_list(var)`
-- `openmcpgdb_variable_list()`
+- `gdb_add_variable_list(var)`
+- `gdb_del_variable_list(var)`
+- `gdb_variable_list()`
 
 ### Inspection
 
-- `openmcpgdb_debugger_state()`
-- `openmcpgdb_current_code()`
-- `openmcpgdb_full_backtrace()`
-- `openmcpgdb_info_threads()`
-- `openmcpgdb_info_regs()`
-- `openmcpgdb_print(var)`
-- `openmcpgdb_set_var(var, value)`
+- `gdb_debugger_state()`
+- `gdb_current_code()`
+- `gdb_full_backtrace()`
+- `gdb_info_threads()`
+- `gdb_info_regs()`
+- `gdb_print(var)`
+- `gdb_set_var(var, value)`
 
 ### Control/config/custom
 
-- `openmcpgdb_quit()`
-- `openmcpgdb_kill()`
-- `openmcpgdb_display_lines_before_current(size)`
-- `openmcpgdb_display_lines_after_current(size)`
-- `openmcpgdb_display_backtrace(size)`
-- `openmcpgdb_display_variable_list(size)`
-- `openmcpgdb_custom(cmd)`
+- `gdb_quit()`
+- `gdb_kill()`
+- `gdb_reset_back_to_not_attached()`
+- `gdb_display_lines_before_current(size)`
+- `gdb_display_lines_after_current(size)`
+- `gdb_display_backtrace(size)`
+- `gdb_display_variable_list(size)`
+- `gdb_custom(cmd)`
 
 ## Testing
 

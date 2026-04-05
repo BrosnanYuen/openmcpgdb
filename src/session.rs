@@ -36,6 +36,7 @@ pub enum ToolOperation {
     InfoRegs,
     Quit,
     Kill,
+    ResetBackToNotAttached,
     SetDisplayLinesBeforeCurrent { size: usize },
     SetDisplayLinesAfterCurrent { size: usize },
     SetDisplayBacktrace { size: usize },
@@ -119,6 +120,21 @@ struct SessionCore<'a> {
 }
 
 impl<'a> SessionCore<'a> {
+    fn recover_error_state_without_restart(&mut self) {
+        if self.debugger_state == DebuggerState::Error {
+            self.debugger_state = self.recoverable_base_state();
+        }
+        self.last_error.clear();
+    }
+
+    fn recoverable_base_state(&self) -> DebuggerState {
+        if self.executable_path.is_some() {
+            DebuggerState::Attached
+        } else {
+            DebuggerState::NotAttached
+        }
+    }
+
     fn new(config: ServerConfig, backend: &'a mut Box<dyn GdbBackend>) -> Self {
         Self {
             config,
@@ -135,34 +151,32 @@ impl<'a> SessionCore<'a> {
         match operation {
             ToolOperation::Execute { executable_path } => {
                 println!(
-                    "[openmcpgdb_execute] requested executable_path={}",
+                    "[gdb_execute] requested executable_path={}",
                     executable_path
                 );
                 self.execute_attach(executable_path).await
             }
             ToolOperation::Run => {
-                println!("[openmcpgdb_run] requested");
+                println!("[gdb_run] requested");
                 self.execute_run().await
             }
             ToolOperation::GdbServer { ip, port, pid } => self.execute_gdbserver(ip, port, pid).await,
             ToolOperation::TargetRemote { ip, port } => {
-                self.execute_command(
-                    &format!("target remote {ip}:{port}"),
-                    Some(DebuggerState::Attached),
-                )
-                .await
+                self.execute_target_remote(ip, port).await
             }
             ToolOperation::SetThread { id } => {
-                self.execute_command(&format!("thread {id}"), None).await
+                self.execute_recoverable_command_with_output(&format!("thread {id}"), None)
+                    .await
             }
             ToolOperation::SetFrame { id } => {
-                self.execute_command(&format!("frame {id}"), None).await
+                self.execute_recoverable_command_with_output(&format!("frame {id}"), None)
+                    .await
             }
             ToolOperation::AddBreakpoint {
                 filename,
                 linenumber,
             } => {
-                self.execute_command(
+                self.execute_recoverable_command_with_output(
                     &format!("break {filename}:{linenumber}"),
                     None,
                 )
@@ -179,14 +193,14 @@ impl<'a> SessionCore<'a> {
                 filename,
                 linenumber,
             } => {
-                self.execute_command(&format!("enable location {filename}:{linenumber}"), None)
+                self.execute_breakpoint_action_by_location(BreakpointAction::Enable, &filename, linenumber)
                     .await
             }
             ToolOperation::DisableBreakpoint {
                 filename,
                 linenumber,
             } => {
-                self.execute_command(&format!("disable location {filename}:{linenumber}"), None)
+                self.execute_breakpoint_action_by_location(BreakpointAction::Disable, &filename, linenumber)
                     .await
             }
             ToolOperation::ListBreakpoint => self.list_breakpoint_response().await,
@@ -220,13 +234,16 @@ impl<'a> SessionCore<'a> {
             ToolOperation::VariableList => self.variable_list_response().await,
             ToolOperation::CurrentCode => self.current_code_response().await,
             ToolOperation::FullBacktrace => self.full_backtrace_response().await,
-            ToolOperation::InfoThreads => self.execute_command_with_output("info threads", None).await,
+            ToolOperation::InfoThreads => {
+                self.execute_recoverable_command_with_output("info threads", None)
+                    .await
+            }
             ToolOperation::Print { var, value } => {
                 if let Some(value) = value {
                     self.execute_command(&format!("set variable {var} = {value}"), None)
                         .await
                 } else {
-                    self.execute_command_with_output(&format!("print {var}"), None)
+                    self.execute_print(&var)
                         .await
                 }
             }
@@ -242,48 +259,133 @@ impl<'a> SessionCore<'a> {
                 {
                     return Ok(self.base_response());
                 }
-                self.execute_command_with_output("info all-registers", None)
-                    .await
+                self.execute_info_regs().await
             }
             ToolOperation::Quit => {
+                if self.executable_path.is_none() {
+                    let _ = self.stop_gdbserver_process().await;
+                    let _ = self.backend.stop().await;
+                    self.debugger_state = DebuggerState::NotAttached;
+                    self.last_error.clear();
+                    self.watched_variables.clear();
+                    return Ok(self.base_response());
+                }
                 let _ = self.stop_gdbserver_process().await;
                 // Interrupt running debuggee before sending quit command.
                 if self.debugger_state == DebuggerState::Running {
                     let _ = self.backend.interrupt().await;
                 }
-                let _ = self.backend.exec("quit").await;
+                let quit_result = self.backend.exec("quit").await;
+                let stop_result = self.backend.stop().await;
+
+                match (quit_result, stop_result) {
+                    (Ok(_), Ok(_)) => {
+                        self.debugger_state = DebuggerState::NotAttached;
+                        self.executable_path = None;
+                        self.watched_variables.clear();
+                        self.last_error.clear();
+                        Ok(self.base_response())
+                    }
+                    (quit_err, stop_err) => {
+                        let mut errors = Vec::new();
+                        if let Err(err) = quit_err {
+                            errors.push(format!("quit failed: {err}"));
+                        }
+                        if let Err(err) = stop_err {
+                            errors.push(format!("stop failed: {err}"));
+                        }
+                        self.debugger_state = DebuggerState::Error;
+                        self.last_error = errors.join("; ");
+                        Ok(self.base_response().with_error(self.last_error.clone()))
+                    }
+                }
+            }
+            ToolOperation::Kill => {
+                self.execute_kill().await
+            }
+            ToolOperation::ResetBackToNotAttached => {
+                let _ = self.stop_gdbserver_process().await;
                 let _ = self.backend.stop().await;
                 self.debugger_state = DebuggerState::NotAttached;
                 self.executable_path = None;
                 self.watched_variables.clear();
+                self.last_error.clear();
                 Ok(self.base_response())
             }
-            ToolOperation::Kill => {
-                // Interrupt running debuggee before sending kill command.
-                if self.debugger_state == DebuggerState::Running {
-                    let _ = self.backend.interrupt().await;
-                }
-                self.execute_command("kill", Some(DebuggerState::SigKill))
-                    .await
-            }
             ToolOperation::SetDisplayLinesBeforeCurrent { size } => {
+                if size == 0 {
+                    self.last_error = "display_lines_before_current must be > 0".to_string();
+                    self.debugger_state = DebuggerState::Error;
+                    return Ok(self.base_response().with_error(self.last_error.clone()));
+                }
                 self.config.display_lines_before_current = size;
+                self.recover_error_state_without_restart();
                 Ok(self.base_response())
             }
             ToolOperation::SetDisplayLinesAfterCurrent { size } => {
+                if size == 0 {
+                    self.last_error = "display_lines_after_current must be > 0".to_string();
+                    self.debugger_state = DebuggerState::Error;
+                    return Ok(self.base_response().with_error(self.last_error.clone()));
+                }
                 self.config.display_lines_after_current = size;
+                self.recover_error_state_without_restart();
                 Ok(self.base_response())
             }
             ToolOperation::SetDisplayBacktrace { size } => {
+                if size == 0 {
+                    self.last_error = "display_backtrace must be > 0".to_string();
+                    self.debugger_state = DebuggerState::Error;
+                    return Ok(self.base_response().with_error(self.last_error.clone()));
+                }
                 self.config.display_backtrace = size;
+                self.recover_error_state_without_restart();
                 Ok(self.base_response())
             }
             ToolOperation::SetDisplayVariableList { size } => {
+                if size == 0 {
+                    self.last_error = "display_variable_list must be > 0".to_string();
+                    self.debugger_state = DebuggerState::Error;
+                    return Ok(self.base_response().with_error(self.last_error.clone()));
+                }
                 self.config.display_variable_list = size;
+                self.recover_error_state_without_restart();
                 Ok(self.base_response())
             }
             ToolOperation::Custom { cmd } => self.execute_command_with_output(&cmd, None).await,
         }
+    }
+
+    async fn execute_recoverable_command_with_output(
+        &mut self,
+        command: &str,
+        fallback_state: Option<DebuggerState>,
+    ) -> Result<DebuggerResponse> {
+        let previous_state = self.debugger_state;
+        let response = self
+            .execute_command_with_output(command, fallback_state)
+            .await?;
+        if response.debugger_state != DebuggerState::Error {
+            return Ok(response);
+        }
+
+        let error_text = response.error.to_ascii_lowercase();
+        if !is_recoverable_command_error(&error_text) {
+            return Ok(response);
+        }
+
+        let recovered_state = if previous_state == DebuggerState::Error {
+            self.recoverable_base_state()
+        } else {
+            previous_state
+        };
+        self.debugger_state = recovered_state;
+        self.last_error.clear();
+
+        let mut soft_error_response = self.base_response();
+        soft_error_response.error = response.error;
+        soft_error_response.command_output = response.command_output;
+        Ok(soft_error_response)
     }
 
     async fn shutdown(&mut self) -> Result<()> {
@@ -296,7 +398,7 @@ impl<'a> SessionCore<'a> {
             self.debugger_state = DebuggerState::FailedToAttach;
             self.last_error = "executable_path must be absolute".to_string();
             eprintln!(
-                "[openmcpgdb_execute] failed: executable path is not absolute: {}",
+                "[gdb_execute] failed: executable path is not absolute: {}",
                 executable_path
             );
             return Ok(self.base_response().with_error(self.last_error.clone()));
@@ -307,7 +409,7 @@ impl<'a> SessionCore<'a> {
                 self.debugger_state = DebuggerState::Attached;
                 self.last_error.clear();
                 println!(
-                    "[openmcpgdb_execute] success: gdb started for {}",
+                    "[gdb_execute] success: gdb started for {}",
                     executable_path
                 );
                 Ok(self.base_response())
@@ -316,7 +418,7 @@ impl<'a> SessionCore<'a> {
                 self.debugger_state = DebuggerState::FailedToAttach;
                 self.last_error = err.to_string();
                 eprintln!(
-                    "[openmcpgdb_execute] failed to start gdb for {}: {}",
+                    "[gdb_execute] failed to start gdb for {}: {}",
                     executable_path, self.last_error
                 );
                 Ok(self.base_response().with_error(self.last_error.clone()))
@@ -348,24 +450,47 @@ impl<'a> SessionCore<'a> {
         fallback_state: Option<DebuggerState>,
         include_output: bool,
     ) -> Result<DebuggerResponse> {
-        if let Err(err) = self.ensure_backend_started().await {
-            self.last_error = err.to_string();
-            self.debugger_state = DebuggerState::FailedToAttach;
-            if command == "run" {
-                eprintln!("[openmcpgdb_run] failed to prepare backend: {}", self.last_error);
-            }
-            return Ok(self.base_response().with_error(self.last_error.clone()));
+        if self.executable_path.is_none() {
+            // Tool commands must not implicitly attach/start gdb. Call execute first.
+            return Ok(self.base_response());
         }
 
+        if self.debugger_state == DebuggerState::Running && command != "continue" {
+            // Re-sync command stream before issuing interactive queries after continue.
+            let _ = self.backend.interrupt().await;
+            let _ = self.backend.exec("printf \"\"").await;
+            self.debugger_state = DebuggerState::StoppedAtStepping;
+        }
+
+        let previous_state = self.debugger_state;
         let result = self.backend.exec(command).await;
         match result {
             Ok(output) => {
                 self.update_state_from_output(&output, fallback_state);
-                let captured_state = self.debugger_state;
-                self.last_error = String::new();
+                if self.debugger_state == DebuggerState::Error {
+                    self.last_error = normalized_command_output(&output)
+                        .unwrap_or_else(|| "gdb command failed".to_string());
+                } else {
+                    self.last_error.clear();
+                }
+                if self.debugger_state == DebuggerState::Error
+                    && previous_state == DebuggerState::Error
+                    && !looks_like_gdb_error(&output)
+                {
+                    // Allow recovery from previous Error state when a command succeeds.
+                    self.debugger_state = self.recoverable_base_state();
+                    self.last_error.clear();
+                }
+                // Make successful tool calls recoverable after stale error state.
+                if self.debugger_state != DebuggerState::Error
+                    && self.debugger_state != DebuggerState::FailedToAttach
+                    && self.debugger_state != DebuggerState::GdbServerFailedToAttach
+                {
+                    self.last_error.clear();
+                }
                 if command == "run" {
                     println!(
-                        "[openmcpgdb_run] success: debugger_state={:?}, gdb_output={}",
+                        "[gdb_run] success: debugger_state={:?}, gdb_output={}",
                         self.debugger_state,
                         output.trim()
                     );
@@ -374,22 +499,146 @@ impl<'a> SessionCore<'a> {
                 if include_output {
                     response.command_output = normalized_command_output(&output);
                 }
-                if self.is_error_state(captured_state) {
-                    self.debugger_state = DebuggerState::NotAttached;
-                }
                 Ok(response)
             }
             Err(err) => {
                 self.last_error = err.to_string();
                 self.debugger_state = DebuggerState::Error;
                 if command == "run" {
-                    eprintln!("[openmcpgdb_run] failed: {}", self.last_error);
+                    eprintln!("[gdb_run] failed: {}", self.last_error);
                 }
                 let response = self.base_response().with_error(self.last_error.clone());
-                self.debugger_state = DebuggerState::NotAttached;
                 Ok(response)
             }
         }
+    }
+
+    async fn execute_print(&mut self, var: &str) -> Result<DebuggerResponse> {
+        let previous_state = self.debugger_state;
+        let response = self
+            .execute_command_with_output(&format!("print {var}"), None)
+            .await?;
+
+        if response.debugger_state != DebuggerState::Error {
+            return Ok(response);
+        }
+
+        // Printing a symbol out of scope should be recoverable: keep session state and return
+        // the command error text without forcing a global debugger error latch.
+        let recovered_state = if previous_state == DebuggerState::Error {
+            if self.executable_path.is_some() {
+                DebuggerState::Attached
+            } else {
+                DebuggerState::NotAttached
+            }
+        } else {
+            previous_state
+        };
+
+        self.debugger_state = recovered_state;
+        self.last_error.clear();
+
+        let mut soft_error_response = self.base_response();
+        soft_error_response.command_output = response.command_output;
+        soft_error_response.error = response.error;
+        Ok(soft_error_response)
+    }
+
+    async fn execute_info_regs(&mut self) -> Result<DebuggerResponse> {
+        let response = self.execute_command_with_output("info all-registers", None).await?;
+        let output = response
+            .command_output
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+
+        if output.contains("no registers") || output.contains("has no registers") {
+            // Keep session attached even when inferior is not currently stopped in a frame.
+            self.debugger_state = DebuggerState::Attached;
+            self.last_error.clear();
+            let mut adjusted = self.base_response();
+            adjusted.command_output = response.command_output;
+            return Ok(adjusted);
+        }
+
+        Ok(response)
+    }
+
+    async fn execute_breakpoint_action_by_location(
+        &mut self,
+        action: BreakpointAction,
+        filename: &str,
+        linenumber: u64,
+    ) -> Result<DebuggerResponse> {
+        if self.executable_path.is_none() {
+            return Ok(self.base_response());
+        }
+
+        if self.debugger_state == DebuggerState::Running {
+            let _ = self.backend.interrupt().await;
+            let _ = self.backend.exec("printf \"\"").await;
+            self.debugger_state = DebuggerState::StoppedAtStepping;
+        }
+
+        let ids = self
+            .resolve_breakpoint_ids_by_location(filename, linenumber)
+            .await?;
+
+        if ids.is_empty() {
+            self.debugger_state = DebuggerState::Error;
+            self.last_error = format!("No breakpoint at {filename}:{linenumber}.");
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
+
+        for id in ids {
+            let command = action.command_for_id(&id);
+            let output = self.backend.exec(&command).await?;
+            self.update_state_from_output(&output, None);
+            if self.debugger_state == DebuggerState::Error {
+                self.last_error = normalized_command_output(&output)
+                    .unwrap_or_else(|| "gdb breakpoint operation failed".to_string());
+                return Ok(self.base_response().with_error(self.last_error.clone()));
+            }
+        }
+
+        self.recover_error_state_without_restart();
+        Ok(self.base_response())
+    }
+
+    async fn resolve_breakpoint_ids_by_location(
+        &mut self,
+        filename: &str,
+        linenumber: u64,
+    ) -> Result<Vec<String>> {
+        let target = std::path::Path::new(filename);
+        let output = self.backend.exec("info breakpoints").await?;
+        let mut ids = Vec::new();
+
+        for line in output.lines() {
+            if let Some((id, path, line_no)) = parse_breakpoint_location_line(line) {
+                if line_no != linenumber {
+                    continue;
+                }
+                let normalized = {
+                    let parsed_path = std::path::Path::new(&path);
+                    if parsed_path.is_absolute() {
+                        parsed_path.to_path_buf()
+                    } else {
+                        self.config.codebase_dir.join(parsed_path)
+                    }
+                };
+
+                if normalized == target
+                    || normalized
+                        .to_string_lossy()
+                        .ends_with(target.to_string_lossy().as_ref())
+                {
+                    ids.push(id);
+                }
+            }
+        }
+
+        Ok(ids)
     }
 
     async fn execute_run(&mut self) -> Result<DebuggerResponse> {
@@ -455,6 +704,31 @@ impl<'a> SessionCore<'a> {
         }
     }
 
+    async fn execute_target_remote(&mut self, ip: String, port: u16) -> Result<DebuggerResponse> {
+        // Remote attach still requires a local gdb process. If it is not started yet,
+        // start gdb with configured executable for symbols before target remote.
+        if self.executable_path.is_none() {
+            match self.backend.start(&self.config.executable_path).await {
+                Ok(_) => {
+                    self.executable_path = Some(self.config.executable_path.clone());
+                    self.debugger_state = DebuggerState::Attached;
+                    self.last_error.clear();
+                }
+                Err(err) => {
+                    self.debugger_state = DebuggerState::FailedToAttach;
+                    self.last_error = err.to_string();
+                    return Ok(self.base_response().with_error(self.last_error.clone()));
+                }
+            }
+        }
+
+        self.execute_command(
+            &format!("target remote {ip}:{port}"),
+            Some(DebuggerState::Attached),
+        )
+        .await
+    }
+
     async fn execute_with_full_snapshot(
         &mut self,
         command: &str,
@@ -502,6 +776,21 @@ impl<'a> SessionCore<'a> {
     }
 
     async fn variable_list_response(&mut self) -> Result<DebuggerResponse> {
+        if self.debugger_state == DebuggerState::NotAttached
+            || self.debugger_state == DebuggerState::FailedToAttach
+            || self.debugger_state == DebuggerState::GdbServerFailedToAttach
+            || self.debugger_state == DebuggerState::Exited
+        {
+            let mut response = self.base_response();
+            response.variable_list = Some(BTreeMap::new());
+            return Ok(response);
+        }
+        if self.debugger_state == DebuggerState::Running {
+            let _ = self.backend.interrupt().await;
+            let _ = self.backend.exec("printf \"\"").await;
+            self.debugger_state = DebuggerState::StoppedAtStepping;
+        }
+        self.recover_error_state_without_restart();
         let mut response = self.base_response();
         response.variable_list = Some(self.collect_variable_list().await?);
         Ok(response)
@@ -515,6 +804,7 @@ impl<'a> SessionCore<'a> {
         {
             return Ok(self.base_response());
         }
+        self.recover_error_state_without_restart();
         let mut response = self.base_response();
         let (backtrace, current_func) = self.collect_backtrace(true).await?;
         response.backtrace = Some(backtrace);
@@ -529,6 +819,12 @@ impl<'a> SessionCore<'a> {
         {
             return Ok(self.base_response());
         }
+        if self.debugger_state == DebuggerState::Running {
+            let _ = self.backend.interrupt().await;
+            let _ = self.backend.exec("printf \"\"").await;
+            self.debugger_state = DebuggerState::StoppedAtStepping;
+        }
+        self.recover_error_state_without_restart();
 
         let output = self.backend.exec("info breakpoints").await;
         match output {
@@ -560,11 +856,24 @@ impl<'a> SessionCore<'a> {
         {
             return Ok(self.base_response());
         }
+        if self.debugger_state == DebuggerState::Running {
+            let _ = self.backend.interrupt().await;
+            let _ = self.backend.exec("printf \"\"").await;
+            self.debugger_state = DebuggerState::StoppedAtStepping;
+        }
+        self.recover_error_state_without_restart();
         let mut response = self.base_response();
         let code = self.collect_current_code().await?;
         response.current_code_path = code.0;
         response.current_code_line = code.1.and_then(|line| i64::try_from(line).ok());
         response.current_code = code.2.map(|lines| self.transform_current_code(lines));
+        if response.current_code_path.is_none()
+            && response.current_code_line.is_none()
+            && response.current_code.is_none()
+            && response.error.is_empty()
+        {
+            response.error = "no current frame".to_string();
+        }
         Ok(response)
     }
 
@@ -579,7 +888,13 @@ impl<'a> SessionCore<'a> {
             let output = self.backend.exec(&format!("print {variable}")).await;
             match output {
                 Ok(output) => {
-                    let value = normalize_gdb_value(&output);
+                    let value = if looks_like_gdb_error(&output) {
+                        let details = normalized_command_output(&output)
+                            .unwrap_or_else(|| "gdb print failed".to_string());
+                        format!("<error: {details}>")
+                    } else {
+                        normalize_gdb_value(&output)
+                    };
                     variables.insert(variable.clone(), value);
                 }
                 Err(err) => {
@@ -660,7 +975,20 @@ impl<'a> SessionCore<'a> {
             Some(code_lines)
         };
 
-        Ok((path, line, current_code))
+        let normalized_path = path.map(|raw| {
+            let path_obj = std::path::Path::new(&raw);
+            if path_obj.is_absolute() {
+                raw
+            } else {
+                self.config
+                    .codebase_dir
+                    .join(path_obj)
+                    .to_string_lossy()
+                    .to_string()
+            }
+        });
+
+        Ok((normalized_path, line, current_code))
     }
 
     fn base_response(&self) -> DebuggerResponse {
@@ -671,24 +999,26 @@ impl<'a> SessionCore<'a> {
         response
     }
 
-    fn is_error_state(&self, state: DebuggerState) -> bool {
-        matches!(
-            state,
-            DebuggerState::SigSegv
-                | DebuggerState::SigAbrt
-                | DebuggerState::SigBus
-                | DebuggerState::SigFpe
-                | DebuggerState::SigIll
-                | DebuggerState::SigTerm
-                | DebuggerState::SigKill
-                | DebuggerState::Error
-                | DebuggerState::FailedToAttach
-                | DebuggerState::GdbServerFailedToAttach
-        )
-    }
-
     fn update_state_from_output(&mut self, output: &str, fallback_state: Option<DebuggerState>) {
         let lower = output.to_ascii_lowercase();
+
+        // GDB command failures should be surfaced as Error state.
+        if lower.contains("undefined command")
+            || lower.contains("ambiguous command")
+            || lower.contains("not recognized")
+            || lower.contains("a syntax error in expression")
+            || lower.contains("cannot find bounds of current function")
+            || lower.contains("no symbol")
+            || lower.contains("unknown thread")
+            || lower.contains("no frame at level")
+            || lower.contains("no source file named")
+            || lower.contains("no breakpoint at")
+            || lower.contains("no breakpoint number")
+            || lower.contains("error:")
+        {
+            self.debugger_state = DebuggerState::Error;
+            return;
+        }
 
         // Signal detection: check both explicit signal names and descriptive messages.
         if lower.contains("sigsegv") || lower.contains("segmentation fault") {
@@ -726,20 +1056,8 @@ impl<'a> SessionCore<'a> {
             self.debugger_state = DebuggerState::SigKill;
             return;
         }
-        if lower.contains("sighup") {
-            self.debugger_state = DebuggerState::SigTerm;
-            return;
-        }
-        if lower.contains("sigpipe") {
-            self.debugger_state = DebuggerState::SigTerm;
-            return;
-        }
-        if lower.contains("sigxcpu") || lower.contains("sigxfsz") {
-            self.debugger_state = DebuggerState::SigTerm;
-            return;
-        }
         if lower.contains("sigint") && !lower.contains("breakpoint") {
-            self.debugger_state = DebuggerState::StoppedAtBreakpoint;
+            self.debugger_state = DebuggerState::StoppedAtStepping;
             return;
         }
 
@@ -754,13 +1072,11 @@ impl<'a> SessionCore<'a> {
         }
 
         // Breakpoint, watchpoint, and catchpoint stop detection.
-        if lower.contains("breakpoint") {
-            let is_creation = lower.contains("breakpoint ")
-                && (lower.contains(" at 0x") || lower.contains(" num "));
-            if is_creation {
-                return;
-            }
+        if contains_breakpoint_stop(output) {
             self.debugger_state = DebuggerState::StoppedAtBreakpoint;
+            return;
+        }
+        if contains_breakpoint_creation(output) {
             return;
         }
         if lower.contains("watchpoint") || lower.contains("hardware watchpoint") {
@@ -784,12 +1100,6 @@ impl<'a> SessionCore<'a> {
             return;
         }
 
-        // Running state detection from GDB output.
-        if lower.contains("continuing") || lower.contains("starting program") {
-            self.debugger_state = DebuggerState::Running;
-            return;
-        }
-
         // Program not running / no context detection.
         if lower.contains("no stack") || lower.contains("no registers") {
             self.debugger_state = DebuggerState::Exited;
@@ -800,6 +1110,12 @@ impl<'a> SessionCore<'a> {
             || lower.contains("the program has no registers now")
         {
             self.debugger_state = DebuggerState::NotAttached;
+            return;
+        }
+
+        // Running state detection from GDB output.
+        if lower.contains("continuing") || lower.contains("starting program") {
+            self.debugger_state = DebuggerState::Running;
             return;
         }
 
@@ -818,6 +1134,14 @@ impl<'a> SessionCore<'a> {
         // Detaching / process finished detection.
         if lower.contains("detaching") || lower.contains("process finished") {
             self.debugger_state = DebuggerState::NotAttached;
+            return;
+        }
+
+        if (lower.contains("inferior") && lower.contains("killed"))
+            || lower.contains("program received signal sigkill")
+            || lower.contains("terminated with signal sigkill")
+        {
+            self.debugger_state = DebuggerState::SigKill;
             return;
         }
 
@@ -843,29 +1167,77 @@ impl<'a> SessionCore<'a> {
         }
     }
 
-    async fn ensure_backend_started(&mut self) -> Result<()> {
-        if self.executable_path.is_some() {
-            return Ok(());
-        }
-
-        let configured_path = self.config.executable_path.clone();
-        if !configured_path.is_absolute() {
-            return Err(OpenMcpGdbError::InvalidConfig(
-                "configured executable_path must be absolute".to_string(),
-            ));
-        }
-
-        self.backend.start(&configured_path).await?;
-        self.executable_path = Some(configured_path);
-        self.debugger_state = DebuggerState::Attached;
-        Ok(())
-    }
-
     async fn stop_gdbserver_process(&mut self) -> Result<()> {
         if let Some(mut child) = self.gdbserver_child.take() {
             let _ = child.kill().await;
         }
         Ok(())
+    }
+
+    async fn execute_kill(&mut self) -> Result<DebuggerResponse> {
+        if self.executable_path.is_none() {
+            return Ok(self.base_response());
+        }
+
+        if self.debugger_state == DebuggerState::Running {
+            let _ = self.backend.interrupt().await;
+            let _ = self.backend.exec("printf \"\"").await;
+            self.debugger_state = DebuggerState::StoppedAtStepping;
+        }
+
+        let output = self.backend.exec("kill").await;
+        match output {
+            Ok(output) => {
+                let mut merged_output = output.clone();
+                if output.to_ascii_lowercase().contains("kill the program being debugged") {
+                    let confirm = self.backend.exec("y").await;
+                    match confirm {
+                        Ok(confirm_output) => {
+                            merged_output.push('\n');
+                            merged_output.push_str(&confirm_output);
+                        }
+                        Err(err) => {
+                            self.debugger_state = DebuggerState::Error;
+                            self.last_error = err.to_string();
+                            return Ok(self.base_response().with_error(self.last_error.clone()));
+                        }
+                    }
+                }
+
+                self.update_state_from_output(&merged_output, None);
+                let lower = merged_output.to_ascii_lowercase();
+                if lower.contains("the program is not being run") || lower.contains("no inferior") {
+                    self.debugger_state = DebuggerState::NotAttached;
+                } else if lower.contains("killed")
+                    || lower.contains("sigkill")
+                    || lower.contains("terminated with signal")
+                {
+                    self.debugger_state = DebuggerState::SigKill;
+                }
+                self.last_error.clear();
+                Ok(self.base_response())
+            }
+            Err(err) => {
+                self.debugger_state = DebuggerState::Error;
+                self.last_error = err.to_string();
+                Ok(self.base_response().with_error(self.last_error.clone()))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BreakpointAction {
+    Enable,
+    Disable,
+}
+
+impl BreakpointAction {
+    fn command_for_id(&self, id: &str) -> String {
+        match self {
+            Self::Enable => format!("enable {id}"),
+            Self::Disable => format!("disable {id}"),
+        }
     }
 }
 
@@ -891,6 +1263,56 @@ fn normalized_command_output(output: &str) -> Option<String> {
     } else {
         Some(stripped.to_string())
     }
+}
+
+fn looks_like_gdb_error(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("undefined command")
+        || lower.contains("ambiguous command")
+        || lower.contains("not recognized")
+        || lower.contains("a syntax error in expression")
+        || lower.contains("cannot find bounds of current function")
+        || lower.contains("no symbol")
+        || lower.contains("unknown thread")
+        || lower.contains("no frame at level")
+        || lower.contains("no source file named")
+        || lower.contains("no breakpoint at")
+        || lower.contains("no breakpoint number")
+        || lower.contains("error:")
+        || lower.contains("cannot access memory")
+}
+
+fn is_recoverable_command_error(lower_error: &str) -> bool {
+    lower_error.contains("no symbol")
+        || lower_error.contains("unknown thread")
+        || lower_error.contains("no frame at level")
+        || lower_error.contains("no source file named")
+        || lower_error.contains("no breakpoint at")
+        || lower_error.contains("no breakpoint number")
+        || lower_error.contains("a syntax error in expression")
+        || lower_error.contains("cannot find bounds of current function")
+}
+
+fn contains_breakpoint_stop(output: &str) -> bool {
+    output.lines().any(|line| {
+        let trimmed = line.trim_start().to_ascii_lowercase();
+        if let Some(rest) = trimmed.strip_prefix("breakpoint ") {
+            return rest.contains(',');
+        }
+        false
+    })
+}
+
+fn contains_breakpoint_creation(output: &str) -> bool {
+    output.lines().any(|line| {
+        let trimmed = line.trim_start().to_ascii_lowercase();
+        if let Some(rest) = trimmed.strip_prefix("breakpoint ") {
+            return rest.contains(" at 0x")
+                || rest.contains(": file ")
+                || rest.contains("pending");
+        }
+        false
+    })
 }
 
 fn parse_path_and_line(frame_output: &str) -> (Option<String>, Option<u64>) {
@@ -928,6 +1350,21 @@ fn parse_gdb_list_line(line: &str) -> Option<(u64, &str)> {
         rest
     };
     Some((number, source))
+}
+
+fn parse_breakpoint_location_line(line: &str) -> Option<(String, String, u64)> {
+    let trimmed = line.trim_start();
+    let mut parts = trimmed.split_whitespace();
+    let id = parts.next()?;
+    if !id.chars().all(|char| char.is_ascii_digit() || char == '.') {
+        return None;
+    }
+
+    let at_idx = trimmed.rfind(" at ")?;
+    let location = trimmed[(at_idx + 4)..].trim();
+    let (path, line_no) = location.rsplit_once(':')?;
+    let line_number = line_no.parse::<u64>().ok()?;
+    Some((id.to_string(), path.to_string(), line_number))
 }
 
 fn parse_backtrace_lines(output: &str, limit: usize, backtrace: &mut BTreeMap<String, String>) {
