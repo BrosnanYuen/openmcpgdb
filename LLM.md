@@ -21,7 +21,7 @@ Rules:
   2) gdb_add_variable_list  watches variable
   3) gdb_add_breakpoint     breakpoint setup
   3) gdb_run                only use this for local executable
-  4) gdb_step/next/continue loops
+  4) gdb_step/gdb_next/gdb_continue loops
   5) inspect state (gdb_current_code, gdb_variable_list, gdb_full_backtrace, gdb_info_threads, gdb_info_regs, gdb_print)
   6) if session is in `error`/signal state and you need a clean slate, call gdb_reset_back_to_not_attached
   7) stop session with gdb_quit
@@ -31,7 +31,7 @@ Rules:
   3) gdb_add_variable_list  watches variable
   4) gdb_add_breakpoint     breakpoint setup
   5) gdb_continue           resume running
-  6) gdb_step/next/continue loops same as above
+  6) gdb_step/gdb_next/gdb_continue loops same as above
 - When modifying values, use gdb_set_var (or gdb_print with value).
 - If debugger_state is `not attached` or `failed to attach`, recover by calling gdb_execute again with the correct absolute executable path.
 - If debugger_state indicates a signal (sigsegv/sigabrt/sigbus/sigfpe/sigill/sigtrap/sigterm/sigkill), immediately collect:
