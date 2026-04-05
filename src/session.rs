@@ -1242,17 +1242,14 @@ impl BreakpointAction {
 }
 
 fn normalize_gdb_value(output: &str) -> String {
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Some((_, rhs)) = trimmed.split_once('=') {
-            return rhs.trim().to_string();
-        }
-        return trimmed.to_string();
+    let trimmed = output.trim();
+    if trimmed.is_empty() {
+        return String::new();
     }
-    String::new()
+    if let Some((_, rhs)) = trimmed.split_once('=') {
+        return rhs.trim().to_string();
+    }
+    return trimmed.to_string();
 }
 
 fn normalized_command_output(output: &str) -> Option<String> {
