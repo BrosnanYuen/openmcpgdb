@@ -97,6 +97,7 @@ pub fn spawn_session_thread(
                         response_tx,
                     } => {
                         let result = core.execute(operation).await;
+                        let result = core.enrich_crash_response_result(result).await;
                         let _ = response_tx.send(result);
                     }
                 }
@@ -120,6 +121,43 @@ struct SessionCore<'a> {
 }
 
 impl<'a> SessionCore<'a> {
+    async fn enrich_crash_response_result(
+        &mut self,
+        result: Result<DebuggerResponse>,
+    ) -> Result<DebuggerResponse> {
+        match result {
+            Ok(response) => self.enrich_crash_response(response).await,
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn enrich_crash_response(
+        &mut self,
+        mut response: DebuggerResponse,
+    ) -> Result<DebuggerResponse> {
+        if !matches!(
+            response.debugger_state,
+            DebuggerState::SigSegv | DebuggerState::SigFpe | DebuggerState::SigIll
+        ) {
+            return Ok(response);
+        }
+
+        if response.backtrace.is_some() {
+            return Ok(response);
+        }
+
+        if self.executable_path.is_none() {
+            return Ok(response);
+        }
+
+        let (backtrace, current_func) = self.collect_backtrace(true).await?;
+        response.backtrace = Some(backtrace);
+        if response.current_func.is_none() {
+            response.current_func = current_func;
+        }
+        Ok(response)
+    }
+
     fn recover_error_state_without_restart(&mut self) {
         if self.debugger_state == DebuggerState::Error {
             self.debugger_state = self.recoverable_base_state();
@@ -909,7 +947,7 @@ impl<'a> SessionCore<'a> {
     async fn collect_backtrace(
         &mut self,
         full: bool,
-    ) -> Result<(BTreeMap<String, String>, Option<String>)> {
+    ) -> Result<(BTreeMap<String, (String, String)>, Option<String>)> {
         let command = if full { "backtrace full" } else { "backtrace" };
         let mut output = self.backend.exec(command).await?;
         let mut backtrace = BTreeMap::new();
@@ -922,11 +960,11 @@ impl<'a> SessionCore<'a> {
             parse_backtrace_lines(&output, self.config.display_backtrace, &mut backtrace);
         }
 
-        let current_func = if let Some(func) = backtrace.get("0") {
+        let current_func = if let Some((func, _)) = backtrace.get("0") {
             Some(func.clone())
         } else {
             let mut best: Option<(u64, String)> = None;
-            for (frame_key, func) in &backtrace {
+            for (frame_key, (func, _)) in &backtrace {
                 if let Ok(frame_num) = frame_key.parse::<u64>() {
                     match &best {
                         Some((best_num, _)) if frame_num >= *best_num => {}
@@ -937,7 +975,7 @@ impl<'a> SessionCore<'a> {
                 }
             }
             best.map(|(_, func)| func)
-                .or_else(|| backtrace.values().next().cloned())
+                .or_else(|| backtrace.values().next().map(|(func, _)| func.clone()))
         };
         Ok((backtrace, current_func))
     }
@@ -1364,18 +1402,22 @@ fn parse_breakpoint_location_line(line: &str) -> Option<(String, String, u64)> {
     Some((id.to_string(), path.to_string(), line_number))
 }
 
-fn parse_backtrace_lines(output: &str, limit: usize, backtrace: &mut BTreeMap<String, String>) {
+fn parse_backtrace_lines(
+    output: &str,
+    limit: usize,
+    backtrace: &mut BTreeMap<String, (String, String)>,
+) {
     for line in output.lines() {
         if backtrace.len() >= limit {
             break;
         }
-        if let Some((frame_number, function)) = parse_backtrace_frame_line(line) {
-            backtrace.insert(frame_number.to_string(), function);
+        if let Some((frame_number, function, location)) = parse_backtrace_frame_line(line) {
+            backtrace.insert(frame_number.to_string(), (function, location));
         }
     }
 }
 
-fn parse_backtrace_frame_line(line: &str) -> Option<(u64, String)> {
+fn parse_backtrace_frame_line(line: &str) -> Option<(u64, String, String)> {
     let hash_idx = line.find('#')?;
     let frame_section = &line[(hash_idx + 1)..];
     let digits_len = frame_section
@@ -1406,7 +1448,12 @@ fn parse_backtrace_frame_line(line: &str) -> Option<(u64, String)> {
         function = name;
     }
 
-    Some((frame_number, function.to_string()))
+    let location = line
+        .rsplit_once(" at ")
+        .map(|(_, loc)| loc.trim().to_string())
+        .unwrap_or_default();
+
+    Some((frame_number, function.to_string(), location))
 }
 
 #[cfg(test)]
@@ -1437,9 +1484,10 @@ mod parse_tests {
             "#0  0x00005555555551cb in compute_pi (value=3) at /tmp/main.c:55",
         );
         assert!(parsed.is_some(), "frame should parse");
-        let (frame_no, function) = parsed.expect("parsed frame");
+        let (frame_no, function, location) = parsed.expect("parsed frame");
         assert_eq!(frame_no, 0);
         assert_eq!(function, "compute_pi");
+        assert_eq!(location, "/tmp/main.c:55");
     }
 
     #[test]

@@ -9,6 +9,7 @@ use rmcp::{
     model::{CallToolRequestParams, ClientInfo, RawContent},
 };
 use std::{path::Path, sync::Arc, time::Duration};
+use tokio::process::Command;
 
 const MAZE_CODEBASE_DIR: &str = "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot";
 const MAZE_BINARY_PATH: &str = "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot";
@@ -44,12 +45,25 @@ fn has_required_paths() -> bool {
         && Path::new(MAZE_BINARY_PATH).exists()
 }
 
+async fn ensure_mazerobot_executable() -> Result<()> {
+    let status = Command::new("chmod")
+        .arg("+x")
+        .arg("./examples/mazerobot/maze_robot")
+        .status()
+        .await?;
+
+    anyhow::ensure!(status.success(), "chmod +x ./examples/mazerobot/maze_robot failed");
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_mcp_server_with_mazerobot_binary() -> Result<()> {
     if !has_required_paths() {
         eprintln!("Skipping test_mcp_server_with_mazerobot_binary: required paths missing");
         return Ok(());
     }
+
+    ensure_mazerobot_executable().await?;
 
     let config = mazerobot_config();
     config.validate()?;
@@ -130,6 +144,8 @@ async fn test_bug_invalid_print_symbol_is_recoverable_without_reset() -> Result<
         eprintln!("Skipping test_bug_invalid_print_symbol_is_recoverable_without_reset: required paths missing");
         return Ok(());
     }
+
+    ensure_mazerobot_executable().await?;
 
     let config = mazerobot_config();
     config.validate()?;
@@ -235,6 +251,8 @@ async fn test_bug_continue_while_running_returns_running_state() -> Result<()> {
         eprintln!("Skipping test_bug_continue_while_running_returns_running_state: required paths missing");
         return Ok(());
     }
+
+    ensure_mazerobot_executable().await?;
 
     let config = mazerobot_config();
     config.validate()?;

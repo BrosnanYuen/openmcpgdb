@@ -57,7 +57,7 @@ pub struct DebuggerResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub breakpoints: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub backtrace: Option<BTreeMap<String, String>>,
+    pub backtrace: Option<BTreeMap<String, (String, String)>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_func: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
