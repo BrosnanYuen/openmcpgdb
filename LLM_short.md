@@ -101,14 +101,6 @@ All calls return `debugger_state` plus optional: `error`, `current_func`, `curre
 | `gdb_info_regs` | none | Register dump |
 | `gdb_custom` | `cmd` | Raw GDB command |
 
-### Display Config
-| Tool | Args | Purpose |
-|------|------|---------|
-| `gdb_display_lines_before_current` | `size` | Pre-context lines |
-| `gdb_display_lines_after_current` | `size` | Post-context lines |
-| `gdb_display_backtrace` | `size` | Max backtrace frames |
-| `gdb_display_variable_list` | `size` | Max watched variables |
-
 ## 4. Debugger States
 
 - `not attached` / `failed to attach` => call `gdb_execute`

@@ -65,7 +65,7 @@ enabled = true
 }
 ```
 
-5. Give [LLM.md](LLM.md ) to your LLM
+5. Give short version guide [LLM_short.md](LLM_short.md) to your LLM. If it doesn't work then use long version [LLM.md](LLM.md)
 
 ## Requirements
 
