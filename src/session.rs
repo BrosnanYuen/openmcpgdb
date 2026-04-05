@@ -32,6 +32,7 @@ pub enum ToolOperation {
     FullBacktrace,
     InfoThreads,
     Print { var: String, value: Option<String> },
+    SetVar { var: String, value: String },
     InfoRegs,
     Quit,
     Kill,
@@ -190,11 +191,11 @@ impl<'a> SessionCore<'a> {
             }
             ToolOperation::ListBreakpoint => self.list_breakpoint_response().await,
             ToolOperation::Next => {
-                self.execute_with_full_snapshot("next", DebuggerState::StoppedAtBreakpoint)
+                self.execute_with_full_snapshot("next", DebuggerState::StoppedAtStepping)
                     .await
             }
             ToolOperation::Step => {
-                self.execute_with_full_snapshot("step", DebuggerState::StoppedAtBreakpoint)
+                self.execute_with_full_snapshot("step", DebuggerState::StoppedAtStepping)
                     .await
             }
             ToolOperation::Continue => {
@@ -229,18 +230,39 @@ impl<'a> SessionCore<'a> {
                         .await
                 }
             }
-            ToolOperation::InfoRegs => self
-                .execute_command_with_output("info all-registers", None)
-                .await,
+            ToolOperation::SetVar { var, value } => {
+                self.execute_command(&format!("set variable {var} = {value}"), None)
+                    .await
+            }
+            ToolOperation::InfoRegs => {
+                if self.debugger_state == DebuggerState::NotAttached
+                    || self.debugger_state == DebuggerState::FailedToAttach
+                    || self.debugger_state == DebuggerState::GdbServerFailedToAttach
+                    || self.debugger_state == DebuggerState::Exited
+                {
+                    return Ok(self.base_response());
+                }
+                self.execute_command_with_output("info all-registers", None)
+                    .await
+            }
             ToolOperation::Quit => {
                 let _ = self.stop_gdbserver_process().await;
+                // Interrupt running debuggee before sending quit command.
+                if self.debugger_state == DebuggerState::Running {
+                    let _ = self.backend.interrupt().await;
+                }
                 let _ = self.backend.exec("quit").await;
                 let _ = self.backend.stop().await;
                 self.debugger_state = DebuggerState::NotAttached;
                 self.executable_path = None;
+                self.watched_variables.clear();
                 Ok(self.base_response())
             }
             ToolOperation::Kill => {
+                // Interrupt running debuggee before sending kill command.
+                if self.debugger_state == DebuggerState::Running {
+                    let _ = self.backend.interrupt().await;
+                }
                 self.execute_command("kill", Some(DebuggerState::SigKill))
                     .await
             }
@@ -339,6 +361,7 @@ impl<'a> SessionCore<'a> {
         match result {
             Ok(output) => {
                 self.update_state_from_output(&output, fallback_state);
+                let captured_state = self.debugger_state;
                 self.last_error = String::new();
                 if command == "run" {
                     println!(
@@ -351,6 +374,9 @@ impl<'a> SessionCore<'a> {
                 if include_output {
                     response.command_output = normalized_command_output(&output);
                 }
+                if self.is_error_state(captured_state) {
+                    self.debugger_state = DebuggerState::NotAttached;
+                }
                 Ok(response)
             }
             Err(err) => {
@@ -359,7 +385,9 @@ impl<'a> SessionCore<'a> {
                 if command == "run" {
                     eprintln!("[openmcpgdb_run] failed: {}", self.last_error);
                 }
-                Ok(self.base_response().with_error(self.last_error.clone()))
+                let response = self.base_response().with_error(self.last_error.clone());
+                self.debugger_state = DebuggerState::NotAttached;
+                Ok(response)
             }
         }
     }
@@ -384,7 +412,7 @@ impl<'a> SessionCore<'a> {
         pid: i64,
     ) -> Result<DebuggerResponse> {
         if pid <= 0 {
-            self.debugger_state = DebuggerState::FailedToAttach;
+            self.debugger_state = DebuggerState::GdbServerFailedToAttach;
             self.last_error = "pid must be > 0".to_string();
             return Ok(self.base_response().with_error(self.last_error.clone()));
         }
@@ -405,7 +433,7 @@ impl<'a> SessionCore<'a> {
         let mut child = match child_result {
             Ok(child) => child,
             Err(err) => {
-                self.debugger_state = DebuggerState::FailedToAttach;
+                self.debugger_state = DebuggerState::GdbServerFailedToAttach;
                 self.last_error = format!("failed to start gdbserver: {err}");
                 return Ok(self.base_response().with_error(self.last_error.clone()));
             }
@@ -414,7 +442,7 @@ impl<'a> SessionCore<'a> {
         sleep(Duration::from_millis(100)).await;
         match child.try_wait().map_err(OpenMcpGdbError::Io)? {
             Some(status) => {
-                self.debugger_state = DebuggerState::FailedToAttach;
+                self.debugger_state = DebuggerState::GdbServerFailedToAttach;
                 self.last_error = format!("gdbserver exited early with status: {status}");
                 Ok(self.base_response().with_error(self.last_error.clone()))
             }
@@ -432,6 +460,13 @@ impl<'a> SessionCore<'a> {
         command: &str,
         fallback_state: DebuggerState,
     ) -> Result<DebuggerResponse> {
+        // Do not auto-restart backend after quit; return current state instead.
+        if self.debugger_state == DebuggerState::NotAttached
+            || self.debugger_state == DebuggerState::FailedToAttach
+            || self.debugger_state == DebuggerState::GdbServerFailedToAttach
+        {
+            return Ok(self.base_response());
+        }
         let response = self.execute_command(command, Some(fallback_state)).await?;
         match response.debugger_state {
             DebuggerState::Error
@@ -443,7 +478,11 @@ impl<'a> SessionCore<'a> {
             | DebuggerState::SigTrap
             | DebuggerState::SigTerm
             | DebuggerState::SigKill
-            | DebuggerState::Exited => return Ok(response),
+            | DebuggerState::Exited
+            | DebuggerState::Running
+            | DebuggerState::NotAttached
+            | DebuggerState::FailedToAttach
+            | DebuggerState::GdbServerFailedToAttach => return Ok(response),
             _ => {}
         }
         self.full_snapshot_response().await
@@ -469,6 +508,13 @@ impl<'a> SessionCore<'a> {
     }
 
     async fn full_backtrace_response(&mut self) -> Result<DebuggerResponse> {
+        // Do not auto-restart backend after quit; return current state instead.
+        if self.debugger_state == DebuggerState::NotAttached
+            || self.debugger_state == DebuggerState::FailedToAttach
+            || self.debugger_state == DebuggerState::GdbServerFailedToAttach
+        {
+            return Ok(self.base_response());
+        }
         let mut response = self.base_response();
         let (backtrace, current_func) = self.collect_backtrace(true).await?;
         response.backtrace = Some(backtrace);
@@ -477,10 +523,11 @@ impl<'a> SessionCore<'a> {
     }
 
     async fn list_breakpoint_response(&mut self) -> Result<DebuggerResponse> {
-        if let Err(err) = self.ensure_backend_started().await {
-            self.last_error = err.to_string();
-            self.debugger_state = DebuggerState::FailedToAttach;
-            return Ok(self.base_response().with_error(self.last_error.clone()));
+        if self.debugger_state == DebuggerState::NotAttached
+            || self.debugger_state == DebuggerState::FailedToAttach
+            || self.debugger_state == DebuggerState::GdbServerFailedToAttach
+        {
+            return Ok(self.base_response());
         }
 
         let output = self.backend.exec("info breakpoints").await;
@@ -506,6 +553,13 @@ impl<'a> SessionCore<'a> {
     }
 
     async fn current_code_response(&mut self) -> Result<DebuggerResponse> {
+        // Do not auto-restart backend after quit; return current state instead.
+        if self.debugger_state == DebuggerState::NotAttached
+            || self.debugger_state == DebuggerState::FailedToAttach
+            || self.debugger_state == DebuggerState::GdbServerFailedToAttach
+        {
+            return Ok(self.base_response());
+        }
         let mut response = self.base_response();
         let code = self.collect_current_code().await?;
         response.current_code_path = code.0;
@@ -617,6 +671,22 @@ impl<'a> SessionCore<'a> {
         response
     }
 
+    fn is_error_state(&self, state: DebuggerState) -> bool {
+        matches!(
+            state,
+            DebuggerState::SigSegv
+                | DebuggerState::SigAbrt
+                | DebuggerState::SigBus
+                | DebuggerState::SigFpe
+                | DebuggerState::SigIll
+                | DebuggerState::SigTerm
+                | DebuggerState::SigKill
+                | DebuggerState::Error
+                | DebuggerState::FailedToAttach
+                | DebuggerState::GdbServerFailedToAttach
+        )
+    }
+
     fn update_state_from_output(&mut self, output: &str, fallback_state: Option<DebuggerState>) {
         let lower = output.to_ascii_lowercase();
 
@@ -701,6 +771,8 @@ impl<'a> SessionCore<'a> {
             self.debugger_state = DebuggerState::StoppedAtBreakpoint;
             return;
         }
+
+        // Program termination and exit detection.
 
         // Program termination and exit detection.
         if lower.contains("exited normally")

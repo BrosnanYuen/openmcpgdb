@@ -245,6 +245,7 @@ All tool responses include `debugger_state` and optional fields like `variable_l
 - `gdbserver attached`
 - `attached`
 - `stopped at breakpoint`
+- `stopped at stepping`
 - `running`
 - `sigsegv`
 - `sigabrt`

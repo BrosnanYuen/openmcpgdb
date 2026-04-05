@@ -7,6 +7,7 @@ use std::{
     collections::HashMap,
     path::Path,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -18,6 +19,8 @@ pub trait GdbBackend: Send + Sync {
     async fn start(&mut self, executable_path: &Path) -> Result<()>;
     async fn exec(&mut self, command: &str) -> Result<String>;
     async fn stop(&mut self) -> Result<()>;
+    /// Send SIGINT to the GDB process to interrupt a running debuggee.
+    async fn interrupt(&mut self) -> Result<()>;
 }
 
 pub trait GdbBackendFactory: Send + Sync {
@@ -157,6 +160,19 @@ impl GdbBackend for RealGdbBackend {
         self.stdout = None;
         Ok(())
     }
+
+    async fn interrupt(&mut self) -> Result<()> {
+        if let Some(child) = self.child.as_mut() {
+            if let Some(pid) = child.id() {
+                // Send SIGINT to the gdb process to interrupt it.
+                // This will cause gdb to stop the running debuggee and return to the prompt.
+                let _ = unsafe { libc::kill(pid as i32, libc::SIGINT) };
+                // Give gdb a moment to process the signal.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -239,6 +255,10 @@ impl GdbBackend for MockGdbBackend {
             .lock()
             .map_err(|_| OpenMcpGdbError::Worker("mock backend poisoned".to_string()))?;
         state.started = false;
+        Ok(())
+    }
+
+    async fn interrupt(&mut self) -> Result<()> {
         Ok(())
     }
 }

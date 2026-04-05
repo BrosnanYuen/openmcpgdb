@@ -187,7 +187,7 @@ openmcpgdb_list_breakpoint {}
 - What it does: executes the next source line, stepping over function calls.
 - Arguments: none.
 - Call this when: isolating logic in the current frame without entering callees.
-- Expected response: usually `stopped at breakpoint`/paused with updated code context.
+- Expected response: `stopped at stepping` when stepping through code without hitting a breakpoint, or `stopped at breakpoint` if a breakpoint was encountered.
 ```text
 openmcpgdb_next {}
 ```
@@ -196,7 +196,16 @@ openmcpgdb_next {}
 - What it does: executes next line and steps into function calls.
 - Arguments: none.
 - Call this when: tracing into called function internals.
-- Expected response: paused in callee or next line; inspect with `current_code`.
+- Expected response: `stopped at stepping` when stepping through code without hitting a breakpoint, or `stopped at breakpoint` if a breakpoint was encountered.
+```text
+openmcpgdb_step {}
+```
+
+`openmcpgdb_step`
+- What it does: executes next line and steps into function calls.
+- Arguments: none.
+- Call this when: tracing into called function internals.
+- Expected response: `stopped at stepping` when stepping through code without hitting a breakpoint, or `stopped at breakpoint` if a breakpoint was encountered.
 ```text
 openmcpgdb_step {}
 ```
@@ -395,6 +404,7 @@ The LLM should branch behavior based on `debugger_state`, including:
 - `gdbserver attached`
 - `attached`
 - `stopped at breakpoint`
+- `stopped at stepping`
 - `running`
 - `sigsegv`
 - `sigabrt`

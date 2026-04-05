@@ -10,10 +10,14 @@ pub enum DebuggerState {
     FailedToAttach,
     #[serde(rename = "gdbserver attached")]
     GdbServerAttached,
+    #[serde(rename = "gdbserver failed to attach")]
+    GdbServerFailedToAttach,
     #[serde(rename = "attached")]
     Attached,
     #[serde(rename = "stopped at breakpoint")]
     StoppedAtBreakpoint,
+    #[serde(rename = "stopped at stepping")]
+    StoppedAtStepping,
     #[serde(rename = "running")]
     Running,
     #[serde(rename = "sigsegv")]

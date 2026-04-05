@@ -112,9 +112,7 @@ impl OpenMcpGdbServer {
     async fn call_operation(&self, operation: ToolOperation) -> Json<DebuggerResponse> {
         match self.worker.execute(operation).await {
             Ok(response) => Json(response),
-            Err(err) => {
-                Json(DebuggerResponse::new(DebuggerState::Error).with_error(err.to_string()))
-            }
+            Err(err) => Json(DebuggerResponse::new(DebuggerState::Error).with_error(err.to_string())),
         }
     }
 }
@@ -341,9 +339,9 @@ impl OpenMcpGdbServer {
         &self,
         Parameters(args): Parameters<SetVarArgs>,
     ) -> Json<DebuggerResponse> {
-        self.call_operation(ToolOperation::Print {
+        self.call_operation(ToolOperation::SetVar {
             var: args.var,
-            value: Some(args.value),
+            value: args.value,
         })
         .await
     }
@@ -641,9 +639,11 @@ mod tests {
                     DebuggerState::NotAttached
                         | DebuggerState::FailedToAttach
                         | DebuggerState::GdbServerAttached
+                        | DebuggerState::GdbServerFailedToAttach
                         | DebuggerState::Attached
                         | DebuggerState::Running
                         | DebuggerState::StoppedAtBreakpoint
+                        | DebuggerState::StoppedAtStepping
                         | DebuggerState::SigAbrt
                         | DebuggerState::SigBus
                         | DebuggerState::SigFpe
@@ -904,6 +904,237 @@ mod tests {
         assert_eq!(
             step_value, "0",
             "step should be 0 at breakpoint on first run, got: {step_value}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_next_returns_not_attached_after_quit() {
+        let handle = MockBackendHandle::with_default_response("Breakpoint 1 at 0x0");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let _ = server.openmcpgdb_quit().await;
+
+        let response = server.openmcpgdb_next().await.0;
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::NotAttached,
+            "next after quit should return NotAttached, got: {:?}",
+            response.debugger_state
+        );
+    }
+
+    #[tokio::test]
+    async fn test_step_returns_not_attached_after_quit() {
+        let handle = MockBackendHandle::with_default_response("Breakpoint 1 at 0x0");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let _ = server.openmcpgdb_quit().await;
+
+        let response = server.openmcpgdb_step().await.0;
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::NotAttached,
+            "step after quit should return NotAttached, got: {:?}",
+            response.debugger_state
+        );
+    }
+
+    #[tokio::test]
+    async fn test_continue_returns_not_attached_after_quit() {
+        let handle = MockBackendHandle::with_default_response("Breakpoint 1 at 0x0");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let _ = server.openmcpgdb_quit().await;
+
+        let response = server.openmcpgdb_continue().await.0;
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::NotAttached,
+            "continue after quit should return NotAttached, got: {:?}",
+            response.debugger_state
+        );
+    }
+
+    #[tokio::test]
+    async fn test_current_code_returns_not_attached_after_quit() {
+        let handle = MockBackendHandle::with_default_response("Breakpoint 1 at 0x0");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let _ = server.openmcpgdb_quit().await;
+
+        let response = server.openmcpgdb_current_code().await.0;
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::NotAttached,
+            "current_code after quit should return NotAttached, got: {:?}",
+            response.debugger_state
+        );
+    }
+
+    #[tokio::test]
+    async fn test_full_backtrace_returns_not_attached_after_quit() {
+        let handle = MockBackendHandle::with_default_response("Breakpoint 1 at 0x0");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let _ = server.openmcpgdb_quit().await;
+
+        let response = server.openmcpgdb_full_backtrace().await.0;
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::NotAttached,
+            "full_backtrace after quit should return NotAttached, got: {:?}",
+            response.debugger_state
+        );
+    }
+
+    #[tokio::test]
+    async fn test_info_regs_returns_not_attached_after_quit() {
+        let handle = MockBackendHandle::with_default_response("Breakpoint 1 at 0x0");
+        handle.set_response(
+            "info all-registers",
+            "rax 0x1 1\n",
+        );
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let _ = server.openmcpgdb_quit().await;
+
+        let response = server.openmcpgdb_info_regs().await.0;
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::NotAttached,
+            "info_regs after quit should return NotAttached, got: {:?}",
+            response.debugger_state
+        );
+    }
+
+    #[tokio::test]
+    async fn test_set_var_uses_dedicated_operation_not_print() {
+        let handle = MockBackendHandle::with_default_response("ok");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle.clone()));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let _ = server
+            .openmcpgdb_set_var(Parameters(SetVarArgs {
+                var: "counter".to_string(),
+                value: "42".to_string(),
+            }))
+            .await;
+
+        let commands = handle.commands();
+        assert!(
+            commands.iter().any(|cmd| cmd.starts_with("set variable counter = 42")),
+            "set_var should send 'set variable' command to gdb, got: {:?}",
+            commands
+        );
+    }
+
+    #[tokio::test]
+    async fn test_info_regs_returns_base_on_exited_state() {
+        let handle = MockBackendHandle::with_default_response("ok");
+        handle.set_response(
+            "info all-registers",
+            "rax 0x1 1\n",
+        );
+        let factory = Arc::new(MockGdbBackendFactory::new(handle.clone()));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        handle.set_response("run", "inferior 1 exited with code 0\n");
+        let _ = server.openmcpgdb_run().await;
+
+        let response = server.openmcpgdb_info_regs().await.0;
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::Exited,
+            "info_regs on Exited state should preserve Exited state, got: {:?}",
+            response.debugger_state
+        );
+        assert!(
+            !handle.commands().iter().any(|cmd| cmd == "info all-registers"),
+            "info_regs should NOT send gdb command when state is Exited, got: {:?}",
+            handle.commands()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_breakpoint_preserves_stopped_at_stepping_state() {
+        let handle = MockBackendHandle::with_default_response("Breakpoint 1 at 0x0");
+        handle.set_response("next", "");
+        handle.set_response("backtrace full", "#0 main\n");
+        handle.set_response("frame", "#0 main at /tmp/main.c:10\n");
+        handle.set_response("list 3,18", "10\tline10\n");
+        handle.set_response("print a", "$1 = 0\n");
+        handle.set_response("info breakpoints", "No breakpoints or watchpoints.\n");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle.clone()));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .openmcpgdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let _ = server.openmcpgdb_next().await;
+
+        let response = server.openmcpgdb_list_breakpoint().await.0;
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::StoppedAtStepping,
+            "list_breakpoint should preserve StoppedAtStepping state, got: {:?}",
+            response.debugger_state
         );
     }
 }
