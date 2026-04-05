@@ -16,15 +16,22 @@ Rules:
 - Always use absolute filesystem paths.
 - Always call tools directly; do not describe hypothetical calls.
 - After each tool call, read and use `debugger_state`.
-- Prefer this flow:
-  1) gdb_execute
-  2) optional gdb_gdbserver + gdb_target_remote for remote pid attach
-  3) breakpoint setup
-  4) gdb_run
-  5) step/next/continue loops
-  6) inspect state (current_code, variable_list, full_backtrace, info_threads, info_regs, print)
-  7) if session is in `error`/signal state and you need a clean slate, call gdb_reset_back_to_not_attached
-  8) stop session with gdb_quit
+- Use this loop repeatedly for local debugging:
+  1) gdb_execute            local executable
+  2) gdb_add_variable_list  watches variable
+  3) gdb_add_breakpoint     breakpoint setup
+  3) gdb_run                only use this for local executable
+  4) gdb_step/next/continue loops
+  5) inspect state (gdb_current_code, gdb_variable_list, gdb_full_backtrace, gdb_info_threads, gdb_info_regs, gdb_print)
+  6) if session is in `error`/signal state and you need a clean slate, call gdb_reset_back_to_not_attached
+  7) stop session with gdb_quit
+- Use this loop repeatedly for remote debugging:
+  1) gdb_gdbserver          starts gdbserver
+  2) gdb_target_remote      attach to gdbserver via ip:port
+  3) gdb_add_variable_list  watches variable
+  4) gdb_add_breakpoint     breakpoint setup
+  5) gdb_continue           resume running
+  6) gdb_step/next/continue loops same as above
 - When modifying values, use gdb_set_var (or gdb_print with value).
 - If debugger_state is `not attached` or `failed to attach`, recover by calling gdb_execute again with the correct absolute executable path.
 - If debugger_state indicates a signal (sigsegv/sigabrt/sigbus/sigfpe/sigill/sigtrap/sigterm/sigkill), immediately collect:
@@ -389,36 +396,19 @@ gdb_display_variable_list {"size":9}
 gdb_custom {"cmd":"info locals"}
 ```
 
-## 4. Recommended LLM Operating Loop
-
-Use this loop repeatedly:
-
-1. Ensure debugger is attached (`gdb_execute` if needed).
-2. For remote attach, start gdbserver (`gdb_gdbserver`) then connect (`gdb_target_remote`).
-3. Install breakpoints.
-4. Start/resume execution (`gdb_run` / `gdb_continue`).
-5. On stop/crash, collect:
-   - `gdb_current_code`
-   - `gdb_full_backtrace`
-   - `gdb_variable_list`
-   - `gdb_info_regs` (for low-level failures)
-6. Use `gdb_step`/`gdb_next` for root-cause isolation.
-7. Optionally change runtime variables (`gdb_set_var`).
-8. If the session is stuck in `error`/signal state and you need to restart workflow, call `gdb_reset_back_to_not_attached`.
-9. End with `gdb_quit`.
-
-## 5. Debugger State Values to Handle
+## 4. Debugger State Values to Handle
 
 The LLM should branch behavior based on `debugger_state`, including:
 
-- `not attached`
-- `failed to attach`
-- `gdbserver attached`
-- `attached`
-- `stopped at breakpoint`
-- `stopped at stepping`
-- `running`
-- `sigsegv`
+- `not attached` => gdb hasn't attached to any executable yet
+- `failed to attach` => gdb failed to attach to executable
+- `gdbserver failed to attach` => gdbserver failed to attach to executable
+- `gdbserver attached` => gdbserver successfully attached
+- `attached` => after gdb attached
+- `stopped at breakpoint` => gdb ONLY stopped at defined breakpoint in code
+- `stopped at stepping` => gdb ONLY stopped when stepping through the code and there is no breakpoints at the line
+- `running` => gdb is running the code without stopping
+- `sigsegv` => executable has segment fault.
 - `sigabrt`
 - `sigbus`
 - `sigfpe`
