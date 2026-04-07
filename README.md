@@ -193,8 +193,8 @@ gdb_step {}
 gdb_print {"var":"counter"}
 gdb_full_backtrace {}
 gdb_continue {}
-gdb_reset_back_to_not_attached {}
 gdb_quit {}
+gdb_reset_back_to_not_attached {}
 ```
 
 Examples of Debugging on gdbserver on exsisting PID:
@@ -209,8 +209,8 @@ gdb_next {}
 gdb_step {}
 gdb_print {"var":"counter"}
 gdb_full_backtrace {}
-gdb_reset_back_to_not_attached {}
 gdb_quit {}
+gdb_reset_back_to_not_attached {}
 ```
 
 Type `quit` to exit the interactive client.
