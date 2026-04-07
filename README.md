@@ -1,5 +1,7 @@
 # openmcpgdb
 
+![Alt Text](./debug.gif)
+
 `openmcpgdb` is an asynchronous Rust MCP server for debugging native programs through GDB.
 It is implemented with the `rmcp` crate and exposes a full `gdb_*` tool API for MCP clients (Codex, Claude Code, opencode-compatible clients).
 
