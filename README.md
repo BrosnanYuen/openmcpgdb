@@ -185,7 +185,7 @@ Examples of Debugging on local GDB:
 ```text
 gdb_execute {"executable_path":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot"}
 gdb_debugger_state {}
-gdb_add_variable_list {"var":"robot_state"}
+gdb_add_variable_list {"var":"robot->sim->robot_row"}
 gdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c","linenumber":20}
 gdb_run {}
 gdb_next {}
@@ -202,7 +202,7 @@ Examples of Debugging on gdbserver on exsisting PID:
 gdb_gdbserver {"ip":"127.0.0.1","port":11444,"pid":149104}
 gdb_target_remote {"ip":"127.0.0.1","port":11444}
 gdb_debugger_state {}
-gdb_add_variable_list {"var":"robot_state"}
+gdb_add_variable_list {"var":"robot->sim->robot_row"}
 gdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c","linenumber":20}
 gdb_continue {}
 gdb_next {}

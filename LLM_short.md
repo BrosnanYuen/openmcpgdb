@@ -30,7 +30,7 @@ Rules:
 **Local:**
 ```
 gdb_execute {"executable_path":"/absolute/path/to/program"}
-gdb_add_variable_list {"var":"robot_state"}
+gdb_add_variable_list {"var":"robot->sim->robot_row"}
 gdb_add_breakpoint {"filename":"/absolute/path/src/main.c","linenumber":20}
 gdb_run {}
 gdb_next {} / gdb_step {} / gdb_continue {} / gdb_interrupt {}
