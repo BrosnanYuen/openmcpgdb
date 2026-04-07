@@ -12,7 +12,7 @@ Rules:
   1) gdb_execute {executable_path}
   2) gdb_add_variable_list / gdb_add_breakpoint
   3) gdb_run
-  4) gdb_step/gdb_next/gdb_continue
+  4) gdb_step/gdb_next/gdb_continue/gdb_interrupt
   5) inspect: gdb_current_code, gdb_variable_list, gdb_full_backtrace, gdb_info_threads, gdb_info_regs, gdb_print
   6) on error/signal: collect diagnostics, then gdb_reset_back_to_not_attached
   7) gdb_quit
@@ -33,7 +33,7 @@ gdb_execute {"executable_path":"/absolute/path/to/program"}
 gdb_add_variable_list {"var":"robot_state"}
 gdb_add_breakpoint {"filename":"/absolute/path/src/main.c","linenumber":20}
 gdb_run {}
-gdb_next {} / gdb_step {} / gdb_continue {}
+gdb_next {} / gdb_step {} / gdb_continue {} / gdb_interrupt {}
 gdb_print {"var":"counter"}
 gdb_full_backtrace {}
 gdb_quit {}
@@ -45,7 +45,7 @@ gdb_gdbserver {"ip":"127.0.0.1","port":11444,"pid":149104}
 gdb_target_remote {"ip":"127.0.0.1","port":11444}
 gdb_add_breakpoint {"filename":"/absolute/path/src/main.c","linenumber":20}
 gdb_continue {}
-gdb_next {} / gdb_step {}
+gdb_next {} / gdb_step {} / gdb_interrupt {}
 gdb_quit {}
 ```
 
@@ -81,6 +81,7 @@ All calls return `debugger_state` plus optional: `error`, `current_func`, `curre
 | `gdb_next` | none | Step over function calls |
 | `gdb_step` | none | Step into function calls |
 | `gdb_continue` | none | Resume until breakpoint/signal/exit |
+| `gdb_interrupt` | none | Interrupt running program and stop at stepping |
 
 ### Variables
 | Tool | Args | When |

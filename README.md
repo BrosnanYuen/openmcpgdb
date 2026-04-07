@@ -330,6 +330,7 @@ All tool responses include `debugger_state` and optional fields like `variable_l
 - `gdb_next()`
 - `gdb_step()`
 - `gdb_continue()`
+- `gdb_interrupt()`
 
 ### Variable watch list
 

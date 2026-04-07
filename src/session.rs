@@ -24,6 +24,7 @@ pub enum ToolOperation {
     Next,
     Step,
     Continue,
+    Interrupt,
     AddVariable { var: String },
     DelVariable { var: String },
     DebuggerState,
@@ -254,6 +255,7 @@ impl<'a> SessionCore<'a> {
                 self.execute_with_full_snapshot("continue", DebuggerState::Running)
                     .await
             }
+            ToolOperation::Interrupt => self.execute_interrupt().await,
             ToolOperation::AddVariable { var } => {
                 if !self
                     .watched_variables
@@ -797,6 +799,35 @@ impl<'a> SessionCore<'a> {
             | DebuggerState::GdbServerFailedToAttach => return Ok(response),
             _ => {}
         }
+        self.full_snapshot_response().await
+    }
+
+    async fn execute_interrupt(&mut self) -> Result<DebuggerResponse> {
+        if self.debugger_state == DebuggerState::NotAttached
+            || self.debugger_state == DebuggerState::FailedToAttach
+            || self.debugger_state == DebuggerState::GdbServerFailedToAttach
+            || self.debugger_state == DebuggerState::Exited
+        {
+            return Ok(self.base_response());
+        }
+
+        let interrupt_result = self.backend.interrupt().await;
+        if let Err(err) = interrupt_result {
+            self.debugger_state = DebuggerState::Error;
+            self.last_error = err.to_string();
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
+
+        // Force prompt resynchronization after SIGINT before issuing follow-up queries.
+        let sync_result = self.backend.exec("printf \"\"").await;
+        if let Err(err) = sync_result {
+            self.debugger_state = DebuggerState::Error;
+            self.last_error = err.to_string();
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
+
+        self.debugger_state = DebuggerState::StoppedAtStepping;
+        self.last_error.clear();
         self.full_snapshot_response().await
     }
 

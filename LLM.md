@@ -21,7 +21,7 @@ Rules:
   2) gdb_add_variable_list  watches variable
   3) gdb_add_breakpoint     breakpoint setup
   3) gdb_run                only use this for local executable
-  4) gdb_step/gdb_next/gdb_continue loops
+  4) gdb_step/gdb_next/gdb_continue/gdb_interrupt loops
   5) inspect state (gdb_current_code, gdb_variable_list, gdb_full_backtrace, gdb_info_threads, gdb_info_regs, gdb_print)
   6) if session is in `error`/signal state and you need a clean slate, call gdb_reset_back_to_not_attached
   7) stop session with gdb_quit
@@ -56,6 +56,7 @@ gdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/maz
 gdb_run {}
 gdb_next {}
 gdb_step {}
+gdb_interrupt {}
 gdb_print {"var":"counter"}
 gdb_full_backtrace {}
 gdb_continue {}
@@ -73,6 +74,7 @@ gdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/maz
 gdb_continue {}
 gdb_next {}
 gdb_step {}
+gdb_interrupt {}
 gdb_print {"var":"counter"}
 gdb_full_backtrace {}
 gdb_reset_back_to_not_attached {}
@@ -226,6 +228,15 @@ gdb_step {}
 - Expected response: `running`, `stopped at breakpoint`, signal state, or `exited`.
 ```text
 gdb_continue {}
+```
+
+`gdb_interrupt`
+- What it does: interrupts a running debuggee and transitions debugger state to `stopped at stepping`.
+- Arguments: none.
+- Call this when: execution is `running` and you need to pause immediately for inspection.
+- Expected response: normal full debugger response with `variable_list`, `backtrace`, `current_func`, and current source context.
+```text
+gdb_interrupt {}
 ```
 
 ### Watch Variable List

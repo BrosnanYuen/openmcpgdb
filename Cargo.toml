@@ -1,6 +1,6 @@
 [package]
 name = "openmcpgdb"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 authors = ["Brosnan Yuen <brosnanyuen@gmail.com>"]
 description = " Interactive MCP server to control gdb. Fully featured and written in rust "

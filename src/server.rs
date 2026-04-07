@@ -259,6 +259,14 @@ impl OpenMcpGdbServer {
     }
 
     #[tool(
+        name = "gdb_interrupt",
+        description = "Interrupt execution and stop at stepping"
+    )]
+    async fn gdb_interrupt(&self) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::Interrupt).await
+    }
+
+    #[tool(
         name = "gdb_add_variable_list",
         description = "Add variable to watch list"
     )]
@@ -576,6 +584,7 @@ mod tests {
             server.gdb_next().await.0,
             server.gdb_step().await.0,
             server.gdb_continue().await.0,
+            server.gdb_interrupt().await.0,
             server
                 .gdb_add_variable_list(Parameters(VariableArgs {
                     var: "a".to_string(),
@@ -1323,6 +1332,68 @@ mod tests {
             DebuggerState::StoppedAtStepping,
             "SIGINT should map to stopped-at-stepping"
         );
+    }
+
+    #[tokio::test]
+    async fn test_gdb_interrupt_returns_stopped_with_full_snapshot() {
+        let (server, handle) = test_server_with_mock();
+
+        let _ = server
+            .gdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let _ = server
+            .gdb_add_variable_list(Parameters(VariableArgs {
+                var: "a".to_string(),
+            }))
+            .await;
+
+        let response = server.gdb_interrupt().await.0;
+
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::StoppedAtStepping,
+            "gdb_interrupt should move session into stopped-at-stepping"
+        );
+        assert!(
+            response.variable_list.is_some(),
+            "gdb_interrupt should return variable_list in normal snapshot response"
+        );
+        assert!(
+            response.backtrace.is_some(),
+            "gdb_interrupt should return backtrace in normal snapshot response"
+        );
+        assert!(
+            response.current_code.is_some(),
+            "gdb_interrupt should return current_code in normal snapshot response"
+        );
+
+        let commands = handle.commands();
+        assert!(
+            commands.iter().any(|cmd| cmd == "printf \"\""),
+            "gdb_interrupt should resync prompt after sending interrupt"
+        );
+        assert!(
+            commands.iter().any(|cmd| cmd == "backtrace full"),
+            "gdb_interrupt should collect backtrace for normal snapshot response"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gdb_interrupt_when_not_attached_returns_base_state() {
+        let (server, _) = test_server_with_mock();
+
+        let response = server.gdb_interrupt().await.0;
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::NotAttached,
+            "gdb_interrupt should be a no-op when not attached"
+        );
+        assert!(response.variable_list.is_none());
+        assert!(response.backtrace.is_none());
+        assert!(response.current_code.is_none());
     }
 
     #[tokio::test]
