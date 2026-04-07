@@ -60,8 +60,8 @@ gdb_interrupt {}
 gdb_print {"var":"counter"}
 gdb_full_backtrace {}
 gdb_continue {}
-gdb_reset_back_to_not_attached {}
 gdb_quit {}
+gdb_reset_back_to_not_attached {}
 ```
 
 Examples of Starting a remote gdbserver and attaching to it and debugging
@@ -77,8 +77,8 @@ gdb_step {}
 gdb_interrupt {}
 gdb_print {"var":"counter"}
 gdb_full_backtrace {}
-gdb_reset_back_to_not_attached {}
 gdb_quit {}
+gdb_reset_back_to_not_attached {}
 ```
 
 ## 3. Tool Reference (All Tools)
