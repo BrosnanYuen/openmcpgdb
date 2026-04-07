@@ -102,8 +102,8 @@ Example:
   "mcp_server_url": "https://localhost:9443",
   "display_lines_before_current": 7,
   "display_lines_after_current": 8,
-  "display_backtrace": 6,
-  "display_variable_list": 9,
+  "display_backtrace": 50,
+  "display_variable_list": 20,
   "display_join_current_code": true
 }
 ```
