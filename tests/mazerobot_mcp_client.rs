@@ -6,7 +6,7 @@ use openmcpgdb::{
 };
 use rmcp::{
     ClientHandler, ServiceExt,
-    model::{CallToolRequestParams, ClientInfo, RawContent},
+    model::{CallToolRequestParams, ClientInfo, ContentBlock},
 };
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio::process::Command;
@@ -128,7 +128,7 @@ fn parse_debugger_response(result: &rmcp::model::CallToolResult) -> serde_json::
     }
 
     for item in &result.content {
-        if let RawContent::Text(text) = &item.raw {
+        if let ContentBlock::Text(text) = item {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text.text) {
                 return value;
             }

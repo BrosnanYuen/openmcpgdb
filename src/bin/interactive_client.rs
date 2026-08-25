@@ -149,11 +149,11 @@ async fn main() -> anyhow::Result<()> {
                 let display_value = if let Some(structured) = response.structured_content {
                     structured
                 } else if let Some(first) = response.content.first() {
-                    if let Some(text) = first.raw.as_text() {
+                    if let Some(text) = first.as_text() {
                         serde_json::from_str::<Value>(&text.text)
-                            .unwrap_or_else(|_| Value::String(text.text.to_string()))
+                            .unwrap_or_else(|_| Value::String(text.text.clone()))
                     } else {
-                        Value::String(format!("{:?}", first.raw))
+                        Value::String(format!("{first:?}"))
                     }
                 } else {
                     Value::Null
