@@ -186,9 +186,10 @@ mod tests {
     fn valid_config_with_stub_gdb(dir: &Path) -> ServerConfig {
         let stub = dir.join("gdb-stub");
         std::fs::write(&stub, "#!/bin/sh\n").expect("write gdb stub");
-        let mut config = ServerConfig::default();
-        config.gdb_path = stub;
-        config
+        ServerConfig {
+            gdb_path: stub,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -308,8 +309,10 @@ mod tests {
 
     #[test]
     fn validate_reports_missing_gdb_command_informatively() {
-        let mut config = ServerConfig::default();
-        config.gdb_path = PathBuf::from("definitely-not-a-real-gdb-binary-xyz");
+        let mut config = ServerConfig {
+            gdb_path: PathBuf::from("definitely-not-a-real-gdb-binary-xyz"),
+            ..Default::default()
+        };
 
         let err = config.validate().expect_err("unknown command should fail");
         let message = err.to_string();
@@ -321,8 +324,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_nonexistent_absolute_gdb_path() {
-        let mut config = ServerConfig::default();
-        config.gdb_path = PathBuf::from("/nonexistent/gdb");
+        let mut config = ServerConfig {
+            gdb_path: PathBuf::from("/nonexistent/gdb"),
+            ..Default::default()
+        };
 
         let err = config.validate().expect_err("bad path should fail");
         assert!(

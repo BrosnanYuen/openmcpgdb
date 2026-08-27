@@ -127,10 +127,10 @@ fn parse_debugger_response(result: &rmcp::model::CallToolResult) -> serde_json::
     }
 
     for item in &result.content {
-        if let ContentBlock::Text(text) = item {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text.text) {
-                return value;
-            }
+        if let ContentBlock::Text(text) = item
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text.text)
+        {
+            return value;
         }
     }
 

@@ -601,7 +601,6 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    #[allow(dead_code)]
     fn test_server_with_mock_joined_code() -> OpenMcpGdbServer {
         let mut config = test_config();
         config.display_join_current_code = true;
@@ -805,7 +804,7 @@ mod tests {
 
         let response = server
             .gdb_add_breakpoint(Parameters(BreakpointLocationArgs {
-                location: format!("/tmp/main.c:10"),
+                location: "/tmp/main.c:10".to_string(),
                 condition: None,
             }))
             .await
@@ -984,7 +983,7 @@ mod tests {
 
         let response = server
             .gdb_add_breakpoint(Parameters(BreakpointLocationArgs {
-                location: format!("/tmp/main.c:10"),
+                location: "/tmp/main.c:10".to_string(),
                 condition: None,
             }))
             .await
@@ -1979,7 +1978,7 @@ mod tests {
 
         let response = server
             .gdb_add_breakpoint(Parameters(BreakpointLocationArgs {
-                location: format!("/tmp/does_not_exist.c:1"),
+                location: "/tmp/does_not_exist.c:1".to_string(),
                 condition: None,
             }))
             .await
@@ -2015,7 +2014,7 @@ mod tests {
 
         let response = server
             .gdb_clear_breakpoint(Parameters(BreakpointTargetArgs {
-                target: format!("/tmp/main.c:9999"),
+                target: "/tmp/main.c:9999".to_string(),
             }))
             .await
             .0;
@@ -2067,7 +2066,7 @@ mod tests {
 
         let response = server
             .gdb_disable_breakpoint(Parameters(BreakpointTargetArgs {
-                target: format!("/tmp/main.c:9999"),
+                target: "/tmp/main.c:9999".to_string(),
             }))
             .await
             .0;
@@ -2094,7 +2093,7 @@ mod tests {
 
         let response = server
             .gdb_enable_breakpoint(Parameters(BreakpointTargetArgs {
-                target: format!("/tmp/main.c:9999"),
+                target: "/tmp/main.c:9999".to_string(),
             }))
             .await
             .0;
@@ -2124,7 +2123,7 @@ mod tests {
 
         let response = server
             .gdb_disable_breakpoint(Parameters(BreakpointTargetArgs {
-                target: format!("/tmp/src/main.c:55"),
+                target: "/tmp/src/main.c:55".to_string(),
             }))
             .await
             .0;
@@ -2161,7 +2160,7 @@ mod tests {
 
         let response = server
             .gdb_enable_breakpoint(Parameters(BreakpointTargetArgs {
-                target: format!("/tmp/src/main.c:55"),
+                target: "/tmp/src/main.c:55".to_string(),
             }))
             .await
             .0;
