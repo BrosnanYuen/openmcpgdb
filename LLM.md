@@ -25,13 +25,17 @@ Rules:
   5) inspect state (gdb_current_code, gdb_variable_list, gdb_full_backtrace, gdb_info_threads, gdb_info_regs, gdb_print)
   6) if session is in `error`/signal state and you need a clean slate, call gdb_reset_back_to_not_attached
   7) stop session with gdb_quit
-- Use this loop repeatedly for remote debugging:
-  1) gdb_gdbserver          starts gdbserver
-  2) gdb_target_remote      attach to gdbserver via ip:port
-  3) gdb_add_variable_list  watches variable
-  4) gdb_add_breakpoint     breakpoint setup
-  5) gdb_continue           resume running
-  6) gdb_step/gdb_next/gdb_continue loops same as above
+- Use this loop repeatedly for remote debugging when ANOTHER host already runs gdbserver (your primary use case):
+  1) gdb_execute            local symbol file identical to remote binary (absolute path)
+  2) gdb_set_sysroot / gdb_set_solib_search_path  if remote libraries need sysroot
+  3) gdb_target_remote      attach to gdbserver via ip:port (or gdb_target_extended_remote for gdbserver --multi)
+  4) gdb_add_variable_list  watches variable
+  5) gdb_add_breakpoint     breakpoint setup
+  6) gdb_continue           resume running (gdb_run is invalid for remote)
+  7) gdb_step/gdb_next/gdb_continue loops same as above
+- Use this loop if the MCP host itself must start gdbserver locally:
+  1) gdb_gdbserver          starts `gdbserver --attach ip:port pid` locally
+  2) gdb_target_remote      then connect to it (as above)
 - When modifying values, use gdb_set_var (or gdb_print with value).
 - If debugger_state is `not attached` or `failed to attach`, recover by calling gdb_execute again with the correct absolute executable path.
 - If debugger_state indicates a signal (sigsegv/sigabrt/sigbus/sigfpe/sigill/sigtrap/sigterm/sigkill), immediately collect:
@@ -49,45 +53,67 @@ Rules:
 
 Examples of Debugging on  Local GDB:
 ```text
-gdb_execute {"executable_path":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot"}
+gdb_execute {"executable_path":"/absolute/path/to/mazerobot/maze_robot"}
 gdb_debugger_state {}
 gdb_add_variable_list {"var":"robot->sim->robot_row"}
-gdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c","linenumber":20}
+gdb_add_breakpoint {"location":"/absolute/path/to/mazerobot/src/main.c:20"}
 gdb_run {}
 gdb_next {}
 gdb_step {}
 gdb_interrupt {}
-gdb_print {"var":"counter"}
+gdb_print {"expression":"counter"}
 gdb_full_backtrace {}
 gdb_continue {}
 gdb_quit {}
 gdb_reset_back_to_not_attached {}
 ```
 
-Examples of Starting a remote gdbserver and attaching to it and debugging
+Examples of Remote debugging when another host already runs gdbserver (primary remote use case):
+```
+gdb_execute {"executable_path":"/absolute/path/to/local_copy_of_remote_binary"}
+gdb_set_sysroot {"path":"/path/to/sysroot"}  // optional for shared libs
+gdb_target_remote {"ip":"192.168.1.50","port":11444}
+gdb_debugger_state {}
+gdb_add_variable_list {"var":"robot->sim->robot_row"}
+gdb_add_breakpoint {"location":"/absolute/path/to/mazerobot/src/main.c:20"}
+gdb_continue {}
+gdb_next {}
+gdb_step {}
+gdb_interrupt {}
+gdb_print {"expression":"counter"}
+gdb_full_backtrace {}
+gdb_quit {}
+gdb_reset_back_to_not_attached {}
+```
+
+Examples of Starting a local gdbserver and attaching to it (MCP host starts gdbserver):
 ```
 gdb_gdbserver {"ip":"127.0.0.1","port":11444,"pid":149104}
 gdb_target_remote {"ip":"127.0.0.1","port":11444}
 gdb_debugger_state {}
 gdb_add_variable_list {"var":"robot->sim->robot_row"}
-gdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c","linenumber":20}
+gdb_add_breakpoint {"location":"/absolute/path/to/mazerobot/src/main.c:20"}
 gdb_continue {}
 gdb_next {}
 gdb_step {}
 gdb_interrupt {}
-gdb_print {"var":"counter"}
+gdb_print {"expression":"counter"}
 gdb_full_backtrace {}
 gdb_quit {}
 gdb_reset_back_to_not_attached {}
 ```
+For gdbserver --multi use `gdb_target_extended_remote` instead of `gdb_target_remote`.
 
 ## 3. Tool Reference (All Tools)
 
 All calls return a JSON payload with `debugger_state` and may include:
+- `stop_reason`: why the debugger last stopped ("breakpoint 1", "watchpoint 2", "sigsegv", "exited").
 - `error`: verbose GDB/tool error text.
 - `current_func`, `current_code_path`, `current_code_line`, `current_code`: execution location context.
 - `backtrace`: frame map from deepest frame (`0`) upward.
 - `variable_list`: watched variable values.
+- `breakpoints`: structured breakpoint/watchpoint rows (`number`, `kind`, `enabled`, `detail`).
+- `memory`: examined memory rows (address -> values) from `gdb_examine_memory`.
 
 ### Execution and Session
 
@@ -100,6 +126,24 @@ All calls return a JSON payload with `debugger_state` and may include:
 gdb_execute {"executable_path":"/absolute/path/to/program"}
 ```
 
+`gdb_attach`
+- What it does: attaches to an already-running process by PID (starts bare gdb; symbols come from the live process).
+- Arguments: `pid` (i64, must be > 0).
+- Call this when: you need to debug a process that is already running and you do not have/need a separate binary path.
+- Expected response: `attached`; `failed to attach`/`error` with details on failure.
+```text
+gdb_attach {"pid":12345}
+```
+
+`gdb_detach`
+- What it does: detaches the debugger while leaving the process running.
+- Arguments: none.
+- Call this when: diagnosis is complete but the target must keep running.
+- Expected response: `not attached`.
+```text
+gdb_detach {}
+```
+
 `gdb_run`
 - What it does: runs the loaded executable in GDB (`run`).
 - Arguments: none.
@@ -110,21 +154,44 @@ gdb_run {}
 ```
 
 `gdb_gdbserver`
-- What it does: starts `gdbserver --attach <ip>:<port> <pid>` from the MCP server process.
+- What it does: starts `gdbserver --attach <ip>:<port> <pid>` from the MCP server process (local-only). For remote hosts where gdbserver already runs, skip this and use `gdb_execute` + `gdb_target_remote` directly.
 - Arguments: `ip` (string), `port` (u16), `pid` (i64, must be > 0).
-- Call this when: attaching gdbserver to a running process before connecting with `gdb_target_remote`.
-- Expected response: `gdbserver attached` on success; `failed to attach` with error details otherwise.
+- Call this when: MCP host itself must launch gdbserver for a local PID before connecting.
+- Expected response: `gdbserver attached` on success; `gdbserver failed to attach` with stderr details otherwise. Uses `gdbserver_path` config (default `gdbserver` via PATH).
 ```text
 gdb_gdbserver {"ip":"127.0.0.1","port":1234,"pid":12345}
 ```
 
 `gdb_target_remote`
-- What it does: connects GDB to a remote debug target (`target remote ip:port`).
+- What it does: connects GDB to a remote debug target (`target remote ip:port`). Requires `gdb_execute` with local symbol file first (must match remote binary).
 - Arguments: `ip` (string), `port` (u16).
 - Call this when: debugging with `gdbserver` or another remote endpoint.
-- Expected response: `attached` on success; `error` if network/target setup fails.
+- Expected response: `attached` on success; `error` if network/target setup fails (e.g. `Connection timed out`, `Connection refused` now surfaced correctly).
 ```text
 gdb_target_remote {"ip":"127.0.0.1","port":1234}
+```
+
+`gdb_target_extended_remote`
+- What it does: connects GDB to an extended remote target (`target extended-remote ip:port` for `gdbserver --multi`).
+- Arguments: `ip` (string), `port` (u16).
+- Call this when: remote uses `gdbserver --multi`.
+```text
+gdb_target_extended_remote {"ip":"127.0.0.1","port":1234}
+```
+
+`gdb_set_sysroot`
+- What it does: sets sysroot for remote library resolution (`set sysroot <path>`).
+- Arguments: `path` (string, e.g. `/path/to/sysroot` or `target:`).
+- Call this when: remote backtrace shows `??` or missing solibs.
+```text
+gdb_set_sysroot {"path":"/tmp/sysroot"}
+```
+
+`gdb_set_solib_search_path`
+- What it does: sets solib search path (`set solib-search-path <path>` colon-separated).
+- Arguments: `path` (string).
+```text
+gdb_set_solib_search_path {"path":"/lib:/usr/lib"}
 ```
 
 `gdb_set_thread`
@@ -148,46 +215,57 @@ gdb_set_frame {"id":0}
 ### Breakpoints
 
 `gdb_add_breakpoint`
-- What it does: inserts a source breakpoint (`break file:line`).
-- Arguments: `filename` (absolute path), `linenumber` (u64, 1-based source line).
+- What it does: inserts a breakpoint at any GDB location, optionally conditional.
+- Arguments: `location` (string: `"file.c:55"`, `"function_name"`, `"file.c:function"`, `"symbol+16"`, or `"*0x4005a0"` for a memory address), `condition` (optional string expression, e.g. `"count == 3"`).
 - Call this when: defining stop points before `run` or while paused.
 - Expected response: success info in output; use `gdb_list_breakpoint` to confirm.
 ```text
-gdb_add_breakpoint {"filename":"/absolute/path/to/file.c","linenumber":20}
+gdb_add_breakpoint {"location":"/absolute/path/to/file.c:20"}
+gdb_add_breakpoint {"location":"*0x4005a0","condition":"attempts > 2"}
 ```
 
 `gdb_clear_breakpoint`
-- What it does: removes breakpoint at source location (`clear file:line`).
-- Arguments: `filename`, `linenumber`.
+- What it does: deletes a breakpoint by number or location.
+- Arguments: `target` (breakpoint number as string, e.g. `"1"`, or any location string).
 - Call this when: a breakpoint is no longer needed or was placed incorrectly.
-- Expected response: location removed or an error if no matching breakpoint exists.
+- Expected response: entry removed or an error if no matching breakpoint exists.
 ```text
-gdb_clear_breakpoint {"filename":"/absolute/path/to/file.c","linenumber":20}
+gdb_clear_breakpoint {"target":"1"}
 ```
 
 `gdb_enable_breakpoint`
-- What it does: enables a disabled breakpoint at location.
-- Arguments: `filename`, `linenumber`.
+- What it does: enables a disabled breakpoint by number or location.
+- Arguments: `target`.
 - Call this when: restoring temporarily disabled breakpoints.
 - Expected response: breakpoint state toggled to enabled.
 ```text
-gdb_enable_breakpoint {"filename":"/absolute/path/to/file.c","linenumber":20}
+gdb_enable_breakpoint {"target":"file.c:20"}
 ```
 
 `gdb_disable_breakpoint`
-- What it does: disables (but does not remove) breakpoint at location.
-- Arguments: `filename`, `linenumber`.
+- What it does: disables (but does not remove) a breakpoint by number or location.
+- Arguments: `target`.
 - Call this when: temporarily suppressing stops without losing breakpoint definitions.
 - Expected response: breakpoint state toggled to disabled.
 ```text
-gdb_disable_breakpoint {"filename":"/absolute/path/to/file.c","linenumber":20}
+gdb_disable_breakpoint {"target":"2.1"}
+```
+
+`gdb_watch`
+- What it does: sets a watchpoint that stops execution when an expression is written, read, or accessed.
+- Arguments: `expression` (string), `mode` (optional: `"write"` default, `"read"`, `"access"`).
+- Call this when: hunting down who modifies a variable or memory address.
+- Expected response: watchpoint created; when triggered later, `stop_reason` reports e.g. `"watchpoint 2"` and state becomes `stopped at breakpoint`.
+```text
+gdb_watch {"expression":"counter"}
+gdb_watch {"expression":"*(int*)0x7fff0000","mode":"read"}
 ```
 
 `gdb_list_breakpoint`
-- What it does: lists all breakpoints (`info breakpoints`).
+- What it does: lists all breakpoints/watchpoints (`info breakpoints`) as structured rows.
 - Arguments: none.
-- Call this when: validating current breakpoint set and enable/disable status.
-- Expected response: GDB listing in payload text, with ids/locations/conditions.
+- Call this when: validating current breakpoints, numbers, and enable/disable status.
+- Expected response: `breakpoints` array of `{number, kind, enabled, detail}`.
 ```text
 gdb_list_breakpoint {}
 ```
@@ -201,15 +279,6 @@ gdb_list_breakpoint {}
 - Expected response: `stopped at stepping` when stepping through code without hitting a breakpoint, or `stopped at breakpoint` if a breakpoint was encountered.
 ```text
 gdb_next {}
-```
-
-`gdb_step`
-- What it does: executes next line and steps into function calls.
-- Arguments: none.
-- Call this when: tracing into called function internals.
-- Expected response: `stopped at stepping` when stepping through code without hitting a breakpoint, or `stopped at breakpoint` if a breakpoint was encountered.
-```text
-gdb_step {}
 ```
 
 `gdb_step`
@@ -237,6 +306,33 @@ gdb_continue {}
 - Expected response: normal full debugger response with `variable_list`, `backtrace`, `current_func`, and current source context.
 ```text
 gdb_interrupt {}
+```
+
+`gdb_finish`
+- What it does: runs until the current function returns (`finish`).
+- Arguments: none.
+- Call this when: you want to see the return value / skip the rest of the current function. Not meaningful in the outermost frame (GDB refuses; surfaced as recoverable error).
+- Expected response: full snapshot at the caller line, or `exited` if the program finished.
+```text
+gdb_finish {}
+```
+
+`gdb_nexti`
+- What it does: steps over exactly one machine instruction (`nexti`).
+- Arguments: none.
+- Call this when: assembly-level debugging without source lines.
+- Expected response: `stopped at stepping` with updated registers/disassembly context.
+```text
+gdb_nexti {}
+```
+
+`gdb_stepi`
+- What it does: steps into exactly one machine instruction (`stepi`).
+- Arguments: none.
+- Call this when: tracing control flow at instruction granularity.
+- Expected response: `stopped at stepping`.
+```text
+gdb_stepi {}
 ```
 
 ### Watch Variable List
@@ -315,13 +411,13 @@ gdb_info_threads {}
 gdb_info_regs {}
 ```
 
-`gdb_print` (read expression)
-- What it does: evaluates an expression (`print <var>`).
-- Arguments: `var` (required), `value` omitted.
+`gdb_print` (evaluate expression)
+- What it does: evaluates any GDB expression (`print <expression>`): variables, casts, dereferences, arithmetic.
+- Arguments: `expression` (string, required).
 - Call this when: one-off variable/expression evaluation is needed.
 - Expected response: printed expression value in output text.
 ```text
-gdb_print {"var":"counter"}
+gdb_print {"expression":"counter"}
 ```
 
 `gdb_set_var` (preferred set call)
@@ -331,6 +427,33 @@ gdb_print {"var":"counter"}
 - Expected response: mutation result; verify using `gdb_print`.
 ```text
 gdb_set_var {"var":"counter","value":"42"}
+```
+
+`gdb_frame_info`
+- What it does: lists arguments and local variables of the selected frame (`info args` + `info locals`).
+- Arguments: none.
+- Call this when: you want the full local state without adding each variable to the watch list.
+- Expected response: labeled text sections "--- args ---" and "--- locals ---" in `command_output`.
+```text
+gdb_frame_info {}
+```
+
+`gdb_disassemble`
+- What it does: disassembles the current function or around an address/symbol (`disassemble [<location>]`).
+- Arguments: `address` (optional string: `"main"`, `"*0x4005a0"`, `"&func"`); omit for current function.
+- Call this when: no source is available, or pairing with `*address` breakpoints and instruction stepping.
+- Expected response: assembler dump text in `command_output`.
+```text
+gdb_disassemble {"address":"main"}
+```
+
+`gdb_examine_memory`
+- What it does: examines raw memory (`x/<count><format><size> <address>`), returning parsed rows in `memory` plus raw text.
+- Arguments: `address` (string, e.g. `"&var"`, `"0x7fff1000"`), `count` (default 16), `format` (`x` hex default, `d`,`u`,`o`,`t`,`c`,`s`,`i`), `size` (`w` word default, `b`,`h`,`g`).
+- Call this when: inspecting buffers, arrays, raw pointers, or memory around a suspicious pointer.
+- Expected response: `memory` map keyed by address and raw dump in `command_output`.
+```text
+gdb_examine_memory {"address":"&counter","count":4,"format":"x","size":"w"}
 ```
 
 ### Control and Server Display Tuning
@@ -362,40 +485,13 @@ gdb_kill {}
 gdb_reset_back_to_not_attached {}
 ```
 
-`gdb_display_lines_before_current`
-- What it does: sets number of source lines shown before current line in `current_code`.
-- Arguments: `size` (usize).
-- Call this when: expanding/reducing pre-context around instruction pointer.
-- Expected response: config update acknowledged in session response.
+`gdb_set_display`
+- What it does: tunes response window sizes at runtime.
+- Arguments (all optional, must be > 0 when given): `lines_before_current`, `lines_after_current`, `backtrace`, `variable_list`.
+- Call this when: shrinking/expanding source context, backtrace depth, or watched-variable count to fit the task.
+- Expected response: session config updated; applies to subsequent responses.
 ```text
-gdb_display_lines_before_current {"size":7}
-```
-
-`gdb_display_lines_after_current`
-- What it does: sets number of source lines shown after current line in `current_code`.
-- Arguments: `size` (usize).
-- Call this when: expanding/reducing post-context around instruction pointer.
-- Expected response: config update acknowledged in session response.
-```text
-gdb_display_lines_after_current {"size":8}
-```
-
-`gdb_display_backtrace`
-- What it does: sets max number of backtrace frames returned in summarized outputs.
-- Arguments: `size` (usize).
-- Call this when: reducing noise or broadening call-chain visibility.
-- Expected response: config update acknowledged in session response.
-```text
-gdb_display_backtrace {"size":6}
-```
-
-`gdb_display_variable_list`
-- What it does: sets max number of watched variables returned in `variable_list`.
-- Arguments: `size` (usize).
-- Call this when: tuning response size for token budget/readability.
-- Expected response: config update acknowledged in session response.
-```text
-gdb_display_variable_list {"size":9}
+gdb_set_display {"backtrace":12,"lines_before_current":4}
 ```
 
 `gdb_custom`

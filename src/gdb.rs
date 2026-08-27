@@ -1,5 +1,5 @@
 use crate::{
-    config::ServerConfig,
+    config::{ServerConfig, split_gdb_options},
     error::{OpenMcpGdbError, Result},
 };
 use async_trait::async_trait;
@@ -43,6 +43,10 @@ pub struct RealGdbBackend {
     stdin: Option<ChildStdin>,
     stdout: Option<BufReader<ChildStdout>>,
     stderr: Option<ChildStderr>,
+    /// Set when an exec() timed out before observing the sentinel. GDB may
+    /// still have output (including a queued sentinel printf) pending, so the
+    /// next exec() must drain the stream first to stay aligned.
+    needs_resync: bool,
 }
 
 impl RealGdbBackend {
@@ -53,6 +57,7 @@ impl RealGdbBackend {
             stdin: None,
             stdout: None,
             stderr: None,
+            needs_resync: false,
         }
     }
 
@@ -62,6 +67,42 @@ impl RealGdbBackend {
                 "gdb process not started, call gdb_execute first".to_string(),
             ));
         }
+        Ok(())
+    }
+
+    /// Realign the gdb command stream after an exec() timeout. Interrupts the
+    /// inferior so gdb returns to the prompt, then drains queued output (which
+    /// may include a stale sentinel printf from the timed-out command) until
+    /// the pipe goes quiet. The next command then reads a clean stream.
+    async fn resync_stream(&mut self) -> Result<()> {
+        let _ = self.interrupt().await;
+        if let Some(stdout) = self.stdout.as_mut() {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let quiet_window = Duration::from_millis(300);
+            let mut last_data: Option<Instant> = None;
+            loop {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                if let Some(last) = last_data
+                    && now - last >= quiet_window
+                {
+                    // No output for a quiet window: gdb has consumed all
+                    // queued commands, so the stream is aligned again.
+                    break;
+                }
+                let mut line = String::new();
+                let remaining = deadline.saturating_duration_since(now);
+                match timeout(remaining, stdout.read_line(&mut line)).await {
+                    Ok(Ok(0)) => break, // gdb exited
+                    Ok(Ok(_)) => last_data = Some(Instant::now()),
+                    Ok(Err(err)) => return Err(OpenMcpGdbError::Io(err)),
+                    Err(_) => break,
+                }
+            }
+        }
+        self.needs_resync = false;
         Ok(())
     }
 }
@@ -76,11 +117,15 @@ impl GdbBackend for RealGdbBackend {
 
         // Build the process command from configured gdb binary and options.
         let mut command = Command::new(&self.config.gdb_path);
-        for option in self.config.gdb_options.split_whitespace() {
+        for option in split_gdb_options(&self.config.gdb_options) {
             command.arg(option);
         }
+        // An empty path starts bare gdb (used by attach-to-pid, which loads
+        // symbol information from the live process instead).
+        if !executable_path.as_os_str().is_empty() {
+            command.arg(executable_path);
+        }
         command
-            .arg(executable_path)
             .arg("--quiet")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -105,6 +150,8 @@ impl GdbBackend for RealGdbBackend {
         self.stdout = Some(BufReader::new(stdout));
         self.stderr = Some(stderr);
         self.child = Some(child);
+        // A fresh gdb process starts with an aligned stream.
+        self.needs_resync = false;
 
         // Normalize gdb behavior for stable machine-driven command parsing.
         let _ = self.exec("set pagination off").await;
@@ -117,6 +164,14 @@ impl GdbBackend for RealGdbBackend {
 
     async fn exec(&mut self, command: &str) -> Result<String> {
         self.ensure_started()?;
+
+        // A previous command may have timed out before its sentinel printf was
+        // consumed by gdb, leaving queued output on the wire. Drain it first so
+        // this command's response is not polluted (or truncated by a stale
+        // sentinel).
+        if self.needs_resync {
+            self.resync_stream().await?;
+        }
 
         // Send the user command and append a sentinel printf to delimit the response.
         let marker = "__OPENMCPGDB_DONE__";
@@ -137,9 +192,11 @@ impl GdbBackend for RealGdbBackend {
         // Drain gdb output lines until the sentinel is observed.
         // Some commands (notably `continue`) may not promptly return to the prompt,
         // so we use a bounded wait and fall back to state inference.
-        let command_timeout = Duration::from_secs(3);
+        // Remote `target remote` needs a longer handshake over the network.
+        let command_timeout = command_timeout_for(command);
         let command_start = Instant::now();
         let mut output = String::new();
+        let mut saw_marker = false;
         let stdout = self
             .stdout
             .as_mut()
@@ -162,16 +219,22 @@ impl GdbBackend for RealGdbBackend {
                 break;
             }
             if line.contains(marker) {
+                saw_marker = true;
                 break;
             }
             output.push_str(&line);
         }
 
+        // If we never saw this command's sentinel, gdb may still have queued
+        // output. Arrange for the next exec() to resync the stream first.
+        self.needs_resync = !saw_marker;
+
         // Collect available stderr output to preserve command failures that GDB emits on stderr.
+        // Remote failures (e.g. connection refused) can appear slightly delayed.
         if let Some(stderr) = self.stderr.as_mut() {
             loop {
                 let mut buf = [0u8; 1024];
-                match timeout(Duration::from_millis(20), stderr.read(&mut buf)).await {
+                match timeout(Duration::from_millis(150), stderr.read(&mut buf)).await {
                     Ok(Ok(0)) => break,
                     Ok(Ok(count)) => {
                         output.push_str(&String::from_utf8_lossy(&buf[..count]));
@@ -208,16 +271,31 @@ impl GdbBackend for RealGdbBackend {
     }
 
     async fn interrupt(&mut self) -> Result<()> {
-        if let Some(child) = self.child.as_mut() {
-            if let Some(pid) = child.id() {
-                // Send SIGINT to the gdb process to interrupt it.
-                // This will cause gdb to stop the running debuggee and return to the prompt.
-                let _ = unsafe { libc::kill(pid as i32, libc::SIGINT) };
-                // Give gdb a moment to process the signal.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+        if let Some(child) = self.child.as_mut()
+            && let Some(pid) = child.id()
+        {
+            // Send SIGINT to the gdb process to interrupt it.
+            // This will cause gdb to send an interrupt packet to a remote stub
+            // (for `target remote`) or stop the local inferior.
+            let _ = unsafe { libc::kill(pid as i32, libc::SIGINT) };
+            // Remote stubs need more time for the interrupt packet round-trip.
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
         Ok(())
+    }
+}
+
+/// Per-command GDB timeout. `continue`/`run` fall back to `Running` quickly
+/// (local case) while `target remote` needs time for network handshake and
+/// symbol loading. Other commands get a moderate 10s window.
+fn command_timeout_for(command: &str) -> Duration {
+    let trimmed = command.trim_start();
+    if trimmed.starts_with("target remote") || trimmed.starts_with("target extended-remote") {
+        Duration::from_secs(15)
+    } else if trimmed == "continue" || trimmed == "run" {
+        Duration::from_secs(3)
+    } else {
+        Duration::from_secs(10)
     }
 }
 
@@ -254,9 +332,7 @@ impl MockBackendHandle {
 
     pub fn set_error(&self, command: &str, error: &str) {
         if let Ok(mut state) = self.inner.lock() {
-            state
-                .errors
-                .insert(command.to_string(), error.to_string());
+            state.errors.insert(command.to_string(), error.to_string());
         }
     }
 

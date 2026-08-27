@@ -12,8 +12,8 @@ It is implemented with the `rmcp` crate and exposes a full `gdb_*` tool API for 
 - GDB process isolation per client.
 - Configurable display windows for source, backtrace, and watched variables.
 - Transport modes:
-  - `https://...` and `http://...` streamable HTTP mode (default)
-  - `stdio://...` for stdio MCP wiring when needed
+  - `stdio://` (default): MCP over stdin/stdout for direct client registration
+  - `http://...` and `https://...`: streamable HTTP mode for remote/shared use
 - Interactive MCP test client binary included.
 - Rust tests include:
   - in-process MCP server/client connectivity
@@ -27,11 +27,11 @@ It is implemented with the `rmcp` crate and exposes a full `gdb_*` tool API for 
 ```bash
 git clone https://github.com/BrosnanYuen/openmcpgdb.git
 cd openmcpgdb
-# Change the settings to point to your codebase and executable
-# Use HTTP for server compatibility 
+# Optional: create a config.json to override defaults (all fields are
+# optional; an empty {} config is valid)
 vim config.json
-# Run MCP server
-cargo run --bin  openmcpgdb  -- config.json 
+# Run MCP server (stdio transport by default, gdb resolved from PATH)
+cargo run --bin openmcpgdb
 ```
 
 2. Add to Claude Code `claude.json`
@@ -72,7 +72,7 @@ enabled = true
 ## Requirements
 
 - Rust toolchain (stable)
-- GDB at an absolute path (default `/usr/bin/gdb`)
+- GDB available on `PATH` (or set `gdb_path` to its absolute location)
 - Linux/macOS environment for the provided examples
 
 ## Project Layout
@@ -88,20 +88,27 @@ enabled = true
 
 ## Configuration
 
-The server loads JSON config from the first CLI argument, defaulting to `config.json` in project root.
+A JSON config file is loaded **only** when its path is passed as the first CLI argument. With no argument the server starts with built-in defaults — it never reads `./config.json` implicitly, so behavior is identical regardless of working directory (important for MCP client registration).
 
-All filesystem paths must be absolute.
+- Run `openmcpgdb --help` for usage.
+- Every field is optional; an empty `{}` config is valid.
+- Relative paths (`gdb_path` command names, `codebase_dir`, `executable_path`) are resolved at startup: bare commands via `PATH`, directories/files against the working directory. After resolution all paths become absolute.
 
-Example:
+> **Note on error reporting:** tools report failure through the structured
+> payload — `debugger_state: "error"` plus an `error` message — while the MCP
+> transport-level `isError` flag stays `false`. Clients should inspect
+> `debugger_state`, not only `isError`.
+
+Example (only overrides what differs from the defaults):
 
 ```json
 {
   "gdb_path": "/usr/bin/gdb",
   "gdb_options": "",
-  "codebase_dir": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot",
-  "executable_path": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot",
+  "codebase_dir": "/path/to/project",
+  "executable_path": "/path/to/project/target/debug/app",
   "mcp_server_name": "MCP GDB Server",
-  "mcp_server_url": "https://localhost:9443",
+  "mcp_server_url": "stdio://",
   "display_lines_before_current": 7,
   "display_lines_after_current": 8,
   "display_backtrace": 50,
@@ -110,15 +117,30 @@ Example:
 }
 ```
 
+Defaults:
+
+| Field | Default |
+| --- | --- |
+| `gdb_path` | `"gdb"` (resolved via `PATH`) |
+| `gdb_options` | `""` |
+| `codebase_dir` | current working directory |
+| `executable_path` | unset (`gdb_execute` receives the binary per call) |
+| `mcp_server_name` | `"MCP GDB Server"` |
+| `mcp_server_url` | `"stdio://"` |
+| `display_lines_before_current` | `7` |
+| `display_lines_after_current` | `8` |
+| `display_backtrace` | `6` |
+| `display_variable_list` | `9` |
+| `display_join_current_code` | `false` |
+
 `display_join_current_code` controls how `current_code` is returned:
 - `false`: object map keyed by line number
 - `true`: single joined string in the format `line | source` with newline separators
 
 ### `mcp_server_url`
 
-- Default: `https://localhost:9443`
+- Default: `stdio://` — MCP over stdin/stdout, the standard transport for registering the server with MCP clients.
 - `http://host:port/path` or `https://host:port/path`: run streamable HTTP on that bind address/path.
-- `stdio://...`: run MCP over stdio.
 
 Note: `https://` is parsed and accepted, but this project currently binds plain TCP HTTP directly. For real TLS, run behind a TLS-terminating reverse proxy.
 
@@ -130,12 +152,26 @@ cargo build
 
 ## Run the MCP Server
 
-### 1. Default HTTPS URL mode
+### 1. Default stdio mode
 
-Use default config:
+No config needed (or keep `mcp_server_url` at its `"stdio://"` default):
 
 ```bash
-cargo run --bin openmcpgdb -- config.json
+cargo run --bin openmcpgdb
+```
+
+Register the binary in your MCP client, e.g. for opencode:
+
+```json
+{
+  "mcp": {
+    "openmcpgdb": {
+      "type": "local",
+      "command": ["target/debug/openmcpgdb"],
+      "enabled": true
+    }
+  }
+}
 ```
 
 ### 2. HTTP/HTTPS custom URL mode
@@ -152,12 +188,12 @@ Run:
 cargo run --bin openmcpgdb -- config.json
 ```
 
-### 3. Optional stdio mode
+### 3. Optional stdio mode via config
 
 Set:
 
 ```json
-"mcp_server_url": "stdio://local"
+"mcp_server_url": "stdio://"
 ```
 
 Run:
@@ -185,31 +221,36 @@ Input format:
 Examples of Debugging on local GDB:
 
 ```text
-gdb_execute {"executable_path":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot"}
+gdb_execute {"executable_path":"/absolute/path/to/program"}
 gdb_debugger_state {}
 gdb_add_variable_list {"var":"robot->sim->robot_row"}
-gdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c","linenumber":20}
+gdb_add_breakpoint {"location":"/absolute/path/to/file.c:20"}
+gdb_add_breakpoint {"location":"*0x4005a0","condition":"count == 3"}
+gdb_watch {"expression":"counter"}
 gdb_run {}
 gdb_next {}
 gdb_step {}
-gdb_print {"var":"counter"}
+gdb_print {"expression":"counter"}
+gdb_examine_memory {"address":"&counter","count":4,"format":"x","size":"w"}
+gdb_disassemble {"address":"main"}
+gdb_frame_info {}
 gdb_full_backtrace {}
 gdb_continue {}
 gdb_quit {}
 gdb_reset_back_to_not_attached {}
 ```
 
-Examples of Debugging on gdbserver on exsisting PID:
+Examples of Debugging on gdbserver on existing PID:
 ```
 gdb_gdbserver {"ip":"127.0.0.1","port":11444,"pid":149104}
 gdb_target_remote {"ip":"127.0.0.1","port":11444}
 gdb_debugger_state {}
 gdb_add_variable_list {"var":"robot->sim->robot_row"}
-gdb_add_breakpoint {"filename":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c","linenumber":20}
+gdb_add_breakpoint {"location":"/absolute/path/to/file.c:20"}
 gdb_continue {}
 gdb_next {}
 gdb_step {}
-gdb_print {"var":"counter"}
+gdb_print {"expression":"counter"}
 gdb_full_backtrace {}
 gdb_quit {}
 gdb_reset_back_to_not_attached {}
@@ -228,27 +269,37 @@ This server is compatible with MCP clients that support either:
 Use MCP server command settings pointing to:
 
 ```bash
-cargo run --bin openmcpgdb -- /home/brosnan/openmcpgdb/openmcpgdb/config.json
+cargo run --bin openmcpgdb
+```
+
+No config needed for `stdio://` (default). Or with an explicit config:
+
+```bash
+cargo run --bin openmcpgdb -- /absolute/path/to/config.json
 ```
 
 And set in config:
 
 ```json
-"mcp_server_url": "stdio://local"
+"mcp_server_url": "stdio://"
 ```
 
 ### OpenAI Codex clients
 
 You can use either mode:
 
-1. `stdio` mode:
+1. `stdio` mode (recommended):
 - server command:
 ```bash
-cargo run --bin openmcpgdb -- /home/brosnan/openmcpgdb/openmcpgdb/config.json
+cargo run --bin openmcpgdb
+```
+- or with config:
+```bash
+cargo run --bin openmcpgdb -- /absolute/path/to/config.json
 ```
 - config URL:
 ```json
-"mcp_server_url": "stdio://local"
+"mcp_server_url": "stdio://"
 ```
 
 2. HTTP mode:
@@ -266,13 +317,19 @@ http://localhost:9443
 For local development, prefer stdio:
 
 ```bash
-cargo run --bin openmcpgdb -- /home/brosnan/openmcpgdb/openmcpgdb/config.json
+cargo run --bin openmcpgdb
+```
+
+Or with config:
+
+```bash
+cargo run --bin openmcpgdb -- /absolute/path/to/config.json
 ```
 
 with:
 
 ```json
-"mcp_server_url": "stdio://local"
+"mcp_server_url": "stdio://"
 ```
 
 If you use HTTP transport, point the client to:
@@ -288,13 +345,14 @@ For true TLS HTTPS, run behind a TLS reverse proxy and expose an HTTPS endpoint 
 
 ## Tool API
 
-All tool responses include `debugger_state` and optional fields like `variable_list`, `backtrace`, `current_code*`, and `error`.
+All tool responses include `debugger_state` and may include `stop_reason`, `variable_list`, `backtrace`, `current_code*`, `current_func`, `breakpoints`, `memory`, `command_output`, and `error`. See `LLM.md` for the full reference.
 
 ### `debugger_state` values
 
 - `not attached`
 - `failed to attach`
 - `gdbserver attached`
+- `gdbserver failed to attach`
 - `attached`
 - `stopped at breakpoint`
 - `stopped at stepping`
@@ -313,24 +371,31 @@ All tool responses include `debugger_state` and optional fields like `variable_l
 ### Execution/session
 
 - `gdb_execute(executable_path)`
+- `gdb_attach(pid)`
+- `gdb_detach()`
 - `gdb_run()`
 - `gdb_gdbserver(ip, port, pid)`
 - `gdb_target_remote(ip, port)`
 - `gdb_set_thread(id)`
 - `gdb_set_frame(id)`
 
-### Breakpoints
+### Breakpoints & watchpoints
 
-- `gdb_add_breakpoint(filename, linenumber)`
-- `gdb_clear_breakpoint(filename, linenumber)`
-- `gdb_enable_breakpoint(filename, linenumber)`
-- `gdb_disable_breakpoint(filename, linenumber)`
-- `gdb_list_breakpoint()`
+Locations accept any GDB form: `"file.c:55"`, `"function"`, `"file.c:function"`, `"symbol+16"`, `"*0x4005a0"`. Breakpoint `target` is a breakpoint number (`"1"`, `"2.1"`) or a location string. `condition` is an optional GDB expression.
+
+- `gdb_add_breakpoint(location, condition?)`
+- `gdb_clear_breakpoint(target)`
+- `gdb_enable_breakpoint(target)`
+- `gdb_disable_breakpoint(target)`
+- `gdb_list_breakpoint()` — structured `{number, kind, enabled, detail}`
+- `gdb_watch(expression, mode?)` — `write` (default), `read`, `access`
 
 ### Stepping
 
-- `gdb_next()`
-- `gdb_step()`
+- `gdb_next()` — step over
+- `gdb_step()` — step into
+- `gdb_nexti()` / `gdb_stepi()` — instruction-level
+- `gdb_finish()` — run until current function returns
 - `gdb_continue()`
 - `gdb_interrupt()`
 
@@ -347,19 +412,19 @@ All tool responses include `debugger_state` and optional fields like `variable_l
 - `gdb_full_backtrace()`
 - `gdb_info_threads()`
 - `gdb_info_regs()`
-- `gdb_print(var)`
+- `gdb_print(expression)` — any GDB expression: casts, derefs, arithmetic
 - `gdb_set_var(var, value)`
+- `gdb_frame_info()` — `info args` + `info locals`
+- `gdb_disassemble(address?)` — current function or around symbol/address
+- `gdb_examine_memory(address, count?, format?, size?)` — `x/<count><format><size> <address>`, `memory` map + raw dump
 
 ### Control/config/custom
 
 - `gdb_quit()`
 - `gdb_kill()`
 - `gdb_reset_back_to_not_attached()`
-- `gdb_display_lines_before_current(size)`
-- `gdb_display_lines_after_current(size)`
-- `gdb_display_backtrace(size)`
-- `gdb_display_variable_list(size)`
-- `gdb_custom(cmd)`
+- `gdb_set_display(lines_before_current?, lines_after_current?, backtrace?, variable_list?)`
+- `gdb_custom(cmd)` — raw GDB command
 
 ## Testing
 
@@ -374,7 +439,7 @@ Included test coverage:
 - MCP server starts and MCP client connects.
 - Unit-style all-tool-call response checks.
 - Integration test starting MCP server with:
-  - codebase: `/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/`
-  - binary: `/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot`
+  - codebase: `examples/mazerobot/`
+  - binary: `examples/mazerobot/maze_robot`
   - MCP client in `tests/mazerobot_mcp_client.rs`
 

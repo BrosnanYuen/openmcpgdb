@@ -77,15 +77,15 @@ fn sort_json_for_display(value: Value) -> Value {
 
 fn format_response_for_display(value: Value) -> (Value, Option<String>) {
     if let Value::Object(mut object) = value {
-        if let Some(Value::String(code)) = object.get("current_code") {
-            if code.contains('\n') {
-                let code_block = code.clone();
-                object.insert(
-                    "current_code".to_string(),
-                    Value::String("<multiline output below>".to_string()),
-                );
-                return (Value::Object(object), Some(code_block));
-            }
+        if let Some(Value::String(code)) = object.get("current_code")
+            && code.contains('\n')
+        {
+            let code_block = code.clone();
+            object.insert(
+                "current_code".to_string(),
+                Value::String("<multiline output below>".to_string()),
+            );
+            return (Value::Object(object), Some(code_block));
         }
         return (Value::Object(object), None);
     }
@@ -149,11 +149,11 @@ async fn main() -> anyhow::Result<()> {
                 let display_value = if let Some(structured) = response.structured_content {
                     structured
                 } else if let Some(first) = response.content.first() {
-                    if let Some(text) = first.raw.as_text() {
+                    if let Some(text) = first.as_text() {
                         serde_json::from_str::<Value>(&text.text)
-                            .unwrap_or_else(|_| Value::String(text.text.to_string()))
+                            .unwrap_or_else(|_| Value::String(text.text.clone()))
                     } else {
-                        Value::String(format!("{:?}", first.raw))
+                        Value::String(format!("{first:?}"))
                     }
                 } else {
                     Value::Null

@@ -17,7 +17,7 @@ pub async fn run_from_config_file(config_path: &Path) -> Result<()> {
     run_from_config(config).await
 }
 
-pub async fn run_from_config(config: ServerConfig) -> Result<()> {
+pub async fn run_from_config(mut config: ServerConfig) -> Result<()> {
     config.validate()?;
 
     let backend_factory = Arc::new(RealGdbBackendFactory);
@@ -60,7 +60,11 @@ async fn run_http_server(url: Url, factory: OpenMcpGdbServerFactory) -> Result<(
         .ok_or_else(|| OpenMcpGdbError::InvalidUrl("missing port in mcp_server_url".to_string()))?;
 
     let raw_path = url.path();
-    let path = if raw_path.is_empty() { "/mcp" } else { raw_path };
+    let path = if raw_path.is_empty() {
+        "/mcp"
+    } else {
+        raw_path
+    };
     let bind_addr = format!("{host}:{port}");
 
     // rmcp manages per-client sessions for streamable-http mode.

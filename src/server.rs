@@ -2,7 +2,7 @@ use crate::{
     config::ServerConfig,
     gdb::GdbBackendFactory,
     protocol::{DebuggerResponse, DebuggerState},
-    session::{SessionWorkerHandle, ToolOperation, spawn_session_thread},
+    session::{SessionWorkerHandle, ToolOperation, WatchMode, spawn_session_thread},
 };
 use rmcp::{
     Json, ServerHandler,
@@ -37,9 +37,30 @@ struct IdArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct BreakpointArgs {
-    filename: String,
-    linenumber: u64,
+struct PidArgs {
+    pid: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct DisassembleArgs {
+    /// Optional address expression or symbol: "main", "*0x4005a0", "&func".
+    /// Omit to disassemble the function of the current frame.
+    address: Option<String>,
+}
+
+/// Any gdb breakpoint location: "main.c:55", "compute_pi", "maze.c:maze_step",
+/// "main+16", or "*0x4005a0" for a memory address.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BreakpointLocationArgs {
+    location: String,
+    /// Optional condition expression, e.g. "count == 3".
+    condition: Option<String>,
+}
+
+/// A breakpoint/watchpoint number ("2") or any gdb location string.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BreakpointTargetArgs {
+    target: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -49,8 +70,8 @@ struct VariableArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct PrintArgs {
-    var: String,
-    value: Option<String>,
+    /// Any gdb expression: variable, cast, dereference, arithmetic, register.
+    expression: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -60,13 +81,77 @@ struct SetVarArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct SizeArgs {
-    size: usize,
+struct CustomArgs {
+    cmd: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum WatchKind {
+    /// Trigger when the expression is written (gdb `watch`).
+    #[default]
+    Write,
+    /// Trigger when the expression is read (gdb `rwatch`).
+    Read,
+    /// Trigger on any access (gdb `awatch`).
+    Access,
+}
+
+impl From<WatchKind> for WatchMode {
+    fn from(kind: WatchKind) -> Self {
+        match kind {
+            WatchKind::Write => WatchMode::Write,
+            WatchKind::Read => WatchMode::Read,
+            WatchKind::Access => WatchMode::Access,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct CustomArgs {
-    cmd: String,
+struct WatchArgs {
+    expression: String,
+    /// What kind of access triggers the watchpoint.
+    #[serde(default)]
+    mode: WatchKind,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExamineMemoryArgs {
+    /// Address expression to start reading: "*0x7fff1000", "&my_var", or "0x4005a0".
+    address: String,
+    /// How many items to display (default 16).
+    count: Option<u32>,
+    /// Display format: x hex, d decimal, u unsigned, o octal, t binary,
+    /// c char, s string, i instruction (default x).
+    format: Option<String>,
+    /// Item size: b byte, h halfword, w word, g giant/8 bytes (default w).
+    size: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SetDisplayArgs {
+    lines_before_current: Option<usize>,
+    lines_after_current: Option<usize>,
+    backtrace: Option<usize>,
+    variable_list: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SysrootArgs {
+    /// Sysroot path for remote debugging (`set sysroot <path>`). Use `target:` prefix for remote fs or absolute local path.
+    path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SolibSearchPathArgs {
+    /// Colon-separated search path for shared libraries (`set solib-search-path <path>`).
+    path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ArchitectureArgs {
+    /// Architecture for `set architecture <arch>` (e.g. `aarch64`, `arm`, `auto`).
+    arch: String,
 }
 
 #[derive(Clone)]
@@ -112,7 +197,9 @@ impl OpenMcpGdbServer {
     async fn call_operation(&self, operation: ToolOperation) -> Json<DebuggerResponse> {
         match self.worker.execute(operation).await {
             Ok(response) => Json(response),
-            Err(err) => Json(DebuggerResponse::new(DebuggerState::Error).with_error(err.to_string())),
+            Err(err) => {
+                Json(DebuggerResponse::new(DebuggerState::Error).with_error(err.to_string()))
+            }
         }
     }
 }
@@ -153,7 +240,7 @@ impl OpenMcpGdbServer {
 
     #[tool(
         name = "gdb_target_remote",
-        description = "Connect to remote target"
+        description = "Connect to remote target (gdb `target remote ip:port`)"
     )]
     async fn gdb_target_remote(
         &self,
@@ -166,74 +253,159 @@ impl OpenMcpGdbServer {
         .await
     }
 
-    #[tool(name = "gdb_set_thread", description = "Set current thread")]
-    async fn gdb_set_thread(
+    #[tool(
+        name = "gdb_target_extended_remote",
+        description = "Connect to extended remote target (gdb `target extended-remote ip:port` for gdbserver --multi)"
+    )]
+    async fn gdb_target_extended_remote(
         &self,
-        Parameters(args): Parameters<IdArgs>,
+        Parameters(args): Parameters<TargetRemoteArgs>,
     ) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::TargetExtendedRemote {
+            ip: args.ip,
+            port: args.port,
+        })
+        .await
+    }
+
+    #[tool(
+        name = "gdb_set_sysroot",
+        description = "Set sysroot for remote debugging (`set sysroot <path>`). Use for cross-target library resolution"
+    )]
+    async fn gdb_set_sysroot(
+        &self,
+        Parameters(args): Parameters<SysrootArgs>,
+    ) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::SetSysroot { path: args.path })
+            .await
+    }
+
+    #[tool(
+        name = "gdb_set_solib_search_path",
+        description = "Set solib search path for remote debugging (`set solib-search-path <path>`)"
+    )]
+    async fn gdb_set_solib_search_path(
+        &self,
+        Parameters(args): Parameters<SolibSearchPathArgs>,
+    ) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::SetSolibSearchPath { path: args.path })
+            .await
+    }
+
+    #[tool(
+        name = "gdb_set_architecture",
+        description = "Set GDB architecture (`set architecture <arch>`, e.g. aarch64, arm, auto) for multi-arch cross debugging"
+    )]
+    async fn gdb_set_architecture(
+        &self,
+        Parameters(args): Parameters<ArchitectureArgs>,
+    ) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::SetArchitecture { arch: args.arch })
+            .await
+    }
+
+    #[tool(name = "gdb_set_thread", description = "Set current thread")]
+    async fn gdb_set_thread(&self, Parameters(args): Parameters<IdArgs>) -> Json<DebuggerResponse> {
         self.call_operation(ToolOperation::SetThread { id: args.id })
             .await
     }
 
     #[tool(name = "gdb_set_frame", description = "Set current frame")]
-    async fn gdb_set_frame(
-        &self,
-        Parameters(args): Parameters<IdArgs>,
-    ) -> Json<DebuggerResponse> {
+    async fn gdb_set_frame(&self, Parameters(args): Parameters<IdArgs>) -> Json<DebuggerResponse> {
         self.call_operation(ToolOperation::SetFrame { id: args.id })
             .await
     }
 
-    #[tool(name = "gdb_add_breakpoint", description = "Add breakpoint")]
+    #[tool(
+        name = "gdb_add_breakpoint",
+        description = "Add breakpoint at any gdb location: file:line, function/symbol name, file:function, symbol+offset, or *memory_address. Optional condition expression"
+    )]
     async fn gdb_add_breakpoint(
         &self,
-        Parameters(args): Parameters<BreakpointArgs>,
+        Parameters(args): Parameters<BreakpointLocationArgs>,
     ) -> Json<DebuggerResponse> {
         self.call_operation(ToolOperation::AddBreakpoint {
-            filename: args.filename,
-            linenumber: args.linenumber,
+            location: args.location,
+            condition: args.condition,
         })
         .await
     }
 
-    #[tool(name = "gdb_clear_breakpoint", description = "Clear breakpoint")]
+    #[tool(
+        name = "gdb_clear_breakpoint",
+        description = "Delete breakpoint by number (from gdb_list_breakpoint) or by location"
+    )]
     async fn gdb_clear_breakpoint(
         &self,
-        Parameters(args): Parameters<BreakpointArgs>,
+        Parameters(args): Parameters<BreakpointTargetArgs>,
     ) -> Json<DebuggerResponse> {
         self.call_operation(ToolOperation::ClearBreakpoint {
-            filename: args.filename,
-            linenumber: args.linenumber,
+            target: args.target,
         })
         .await
     }
 
     #[tool(
         name = "gdb_enable_breakpoint",
-        description = "Enable breakpoint"
+        description = "Enable breakpoint by number or location"
     )]
     async fn gdb_enable_breakpoint(
         &self,
-        Parameters(args): Parameters<BreakpointArgs>,
+        Parameters(args): Parameters<BreakpointTargetArgs>,
     ) -> Json<DebuggerResponse> {
         self.call_operation(ToolOperation::EnableBreakpoint {
-            filename: args.filename,
-            linenumber: args.linenumber,
+            target: args.target,
         })
         .await
     }
 
     #[tool(
         name = "gdb_disable_breakpoint",
-        description = "Disable breakpoint"
+        description = "Disable breakpoint by number or location"
     )]
     async fn gdb_disable_breakpoint(
         &self,
-        Parameters(args): Parameters<BreakpointArgs>,
+        Parameters(args): Parameters<BreakpointTargetArgs>,
     ) -> Json<DebuggerResponse> {
         self.call_operation(ToolOperation::DisableBreakpoint {
-            filename: args.filename,
-            linenumber: args.linenumber,
+            target: args.target,
+        })
+        .await
+    }
+
+    #[tool(
+        name = "gdb_watch",
+        description = "Set watchpoint on an expression or address: triggers on write (default), read, or any access"
+    )]
+    async fn gdb_watch(&self, Parameters(args): Parameters<WatchArgs>) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::Watch {
+            expression: args.expression,
+            mode: args.mode.into(),
+        })
+        .await
+    }
+
+    #[tool(
+        name = "gdb_examine_memory",
+        description = "Examine raw memory at an address with configurable count, format (x/d/u/o/t/c/s/i), and size (b/h/w/g)"
+    )]
+    async fn gdb_examine_memory(
+        &self,
+        Parameters(args): Parameters<ExamineMemoryArgs>,
+    ) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::ExamineMemory {
+            address: args.address,
+            count: args.count.unwrap_or(16),
+            format: args
+                .format
+                .as_deref()
+                .and_then(|s| s.chars().next())
+                .unwrap_or('x'),
+            size: args
+                .size
+                .as_deref()
+                .and_then(|s| s.chars().next())
+                .unwrap_or('w'),
         })
         .await
     }
@@ -241,6 +413,23 @@ impl OpenMcpGdbServer {
     #[tool(name = "gdb_list_breakpoint", description = "List breakpoints")]
     async fn gdb_list_breakpoint(&self) -> Json<DebuggerResponse> {
         self.call_operation(ToolOperation::ListBreakpoint).await
+    }
+
+    #[tool(
+        name = "gdb_attach",
+        description = "Attach to a running process by PID (starts a bare gdb; symbols are read from the live process)"
+    )]
+    async fn gdb_attach(&self, Parameters(args): Parameters<PidArgs>) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::Attach { pid: args.pid })
+            .await
+    }
+
+    #[tool(
+        name = "gdb_detach",
+        description = "Detach from the current process, leaving it running"
+    )]
+    async fn gdb_detach(&self) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::Detach).await
     }
 
     #[tool(name = "gdb_next", description = "Step over")]
@@ -256,6 +445,14 @@ impl OpenMcpGdbServer {
     #[tool(name = "gdb_continue", description = "Continue execution")]
     async fn gdb_continue(&self) -> Json<DebuggerResponse> {
         self.call_operation(ToolOperation::Continue).await
+    }
+
+    #[tool(
+        name = "gdb_finish",
+        description = "Run until the current function returns"
+    )]
+    async fn gdb_finish(&self) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::Finish).await
     }
 
     #[tool(
@@ -295,10 +492,7 @@ impl OpenMcpGdbServer {
         self.call_operation(ToolOperation::DebuggerState).await
     }
 
-    #[tool(
-        name = "gdb_variable_list",
-        description = "Get watched variable list"
-    )]
+    #[tool(name = "gdb_variable_list", description = "Get watched variable list")]
     async fn gdb_variable_list(&self) -> Json<DebuggerResponse> {
         self.call_operation(ToolOperation::VariableList).await
     }
@@ -316,25 +510,18 @@ impl OpenMcpGdbServer {
         self.call_operation(ToolOperation::FullBacktrace).await
     }
 
-    #[tool(
-        name = "gdb_info_threads",
-        description = "Get thread information"
-    )]
+    #[tool(name = "gdb_info_threads", description = "Get thread information")]
     async fn gdb_info_threads(&self) -> Json<DebuggerResponse> {
         self.call_operation(ToolOperation::InfoThreads).await
     }
 
     #[tool(
         name = "gdb_print",
-        description = "Print variable or set variable"
+        description = "Evaluate and print an expression: variables, casts, dereferences, arithmetic"
     )]
-    async fn gdb_print(
-        &self,
-        Parameters(args): Parameters<PrintArgs>,
-    ) -> Json<DebuggerResponse> {
+    async fn gdb_print(&self, Parameters(args): Parameters<PrintArgs>) -> Json<DebuggerResponse> {
         self.call_operation(ToolOperation::Print {
-            var: args.var,
-            value: args.value,
+            expression: args.expression,
         })
         .await
     }
@@ -354,10 +541,7 @@ impl OpenMcpGdbServer {
         .await
     }
 
-    #[tool(
-        name = "gdb_info_regs",
-        description = "Get register information"
-    )]
+    #[tool(name = "gdb_info_regs", description = "Get register information")]
     async fn gdb_info_regs(&self) -> Json<DebuggerResponse> {
         self.call_operation(ToolOperation::InfoRegs).await
     }
@@ -382,58 +566,56 @@ impl OpenMcpGdbServer {
     }
 
     #[tool(
-        name = "gdb_display_lines_before_current",
-        description = "Set lines before current"
+        name = "gdb_set_display",
+        description = "Tune display window sizes for responses: source context lines, backtrace depth, watched variable count"
     )]
-    async fn gdb_display_lines_before_current(
+    async fn gdb_set_display(
         &self,
-        Parameters(args): Parameters<SizeArgs>,
+        Parameters(args): Parameters<SetDisplayArgs>,
     ) -> Json<DebuggerResponse> {
-        self.call_operation(ToolOperation::SetDisplayLinesBeforeCurrent { size: args.size })
-            .await
+        self.call_operation(ToolOperation::SetDisplay {
+            lines_before_current: args.lines_before_current,
+            lines_after_current: args.lines_after_current,
+            backtrace: args.backtrace,
+            variable_list: args.variable_list,
+        })
+        .await
+    }
+
+    #[tool(name = "gdb_nexti", description = "Step over one machine instruction")]
+    async fn gdb_nexti(&self) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::NextInstruction).await
+    }
+
+    #[tool(name = "gdb_stepi", description = "Step into one machine instruction")]
+    async fn gdb_stepi(&self) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::StepInstruction).await
     }
 
     #[tool(
-        name = "gdb_display_lines_after_current",
-        description = "Set lines after current"
+        name = "gdb_disassemble",
+        description = "Disassemble the current function, or around an address/symbol expression"
     )]
-    async fn gdb_display_lines_after_current(
+    async fn gdb_disassemble(
         &self,
-        Parameters(args): Parameters<SizeArgs>,
+        Parameters(args): Parameters<DisassembleArgs>,
     ) -> Json<DebuggerResponse> {
-        self.call_operation(ToolOperation::SetDisplayLinesAfterCurrent { size: args.size })
-            .await
+        self.call_operation(ToolOperation::Disassemble {
+            address: args.address,
+        })
+        .await
     }
 
     #[tool(
-        name = "gdb_display_backtrace",
-        description = "Set backtrace depth"
+        name = "gdb_frame_info",
+        description = "List arguments and local variables of the selected frame"
     )]
-    async fn gdb_display_backtrace(
-        &self,
-        Parameters(args): Parameters<SizeArgs>,
-    ) -> Json<DebuggerResponse> {
-        self.call_operation(ToolOperation::SetDisplayBacktrace { size: args.size })
-            .await
-    }
-
-    #[tool(
-        name = "gdb_display_variable_list",
-        description = "Set variable list size"
-    )]
-    async fn gdb_display_variable_list(
-        &self,
-        Parameters(args): Parameters<SizeArgs>,
-    ) -> Json<DebuggerResponse> {
-        self.call_operation(ToolOperation::SetDisplayVariableList { size: args.size })
-            .await
+    async fn gdb_frame_info(&self) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::FrameInfo).await
     }
 
     #[tool(name = "gdb_custom", description = "Run custom gdb command")]
-    async fn gdb_custom(
-        &self,
-        Parameters(args): Parameters<CustomArgs>,
-    ) -> Json<DebuggerResponse> {
+    async fn gdb_custom(&self, Parameters(args): Parameters<CustomArgs>) -> Json<DebuggerResponse> {
         self.call_operation(ToolOperation::Custom { cmd: args.cmd })
             .await
     }
@@ -458,15 +640,13 @@ mod tests {
         gdb::{MockBackendHandle, MockGdbBackendFactory},
         protocol::DebuggerState,
     };
-    use rmcp::{
-        ClientHandler,
-        model::ClientInfo,
-    };
+    use rmcp::{ClientHandler, model::ClientInfo};
 
     fn test_config() -> ServerConfig {
         ServerConfig {
             gdb_path: "/usr/bin/gdb".into(),
             gdb_options: String::new(),
+            gdbserver_path: "gdbserver".into(),
             codebase_dir: "/tmp".into(),
             executable_path: "/tmp/exe".into(),
             mcp_server_name: "MCP GDB Server".to_string(),
@@ -488,7 +668,10 @@ mod tests {
             "48\tline48\n49\tline49\n50\tline50\n55\tline55\n",
         );
         handle.set_response("print a", "$1 = 10\n");
-        handle.set_response("info threads", "  Id   Target Id         Frame\n* 1    Thread 0x1 main\n");
+        handle.set_response(
+            "info threads",
+            "  Id   Target Id         Frame\n* 1    Thread 0x1 main\n",
+        );
         handle.set_response(
             "info all-registers",
             "rax            0x1                 1\nrbx            0x2                 2\n",
@@ -498,7 +681,6 @@ mod tests {
         (server, handle)
     }
 
-    #[allow(dead_code)]
     #[allow(dead_code)]
     fn test_server_with_mock_joined_code() -> OpenMcpGdbServer {
         let mut config = test_config();
@@ -544,46 +726,63 @@ mod tests {
                 }))
                 .await
                 .0,
+            server.gdb_set_thread(Parameters(IdArgs { id: 1 })).await.0,
+            server.gdb_set_frame(Parameters(IdArgs { id: 0 })).await.0,
             server
-                .gdb_set_thread(Parameters(IdArgs { id: 1 }))
-                .await
-                .0,
-            server
-                .gdb_set_frame(Parameters(IdArgs { id: 0 }))
-                .await
-                .0,
-            server
-                .gdb_add_breakpoint(Parameters(BreakpointArgs {
-                    filename: "/tmp/main.c".to_string(),
-                    linenumber: 10,
+                .gdb_add_breakpoint(Parameters(BreakpointLocationArgs {
+                    location: "/tmp/main.c:10".to_string(),
+                    condition: None,
                 }))
                 .await
                 .0,
             server
-                .gdb_clear_breakpoint(Parameters(BreakpointArgs {
-                    filename: "/tmp/main.c".to_string(),
-                    linenumber: 10,
+                .gdb_add_breakpoint(Parameters(BreakpointLocationArgs {
+                    location: "*0x4005a0".to_string(),
+                    condition: Some("count == 3".to_string()),
                 }))
                 .await
                 .0,
             server
-                .gdb_enable_breakpoint(Parameters(BreakpointArgs {
-                    filename: "/tmp/main.c".to_string(),
-                    linenumber: 10,
+                .gdb_clear_breakpoint(Parameters(BreakpointTargetArgs {
+                    target: "/tmp/main.c:10".to_string(),
                 }))
                 .await
                 .0,
             server
-                .gdb_disable_breakpoint(Parameters(BreakpointArgs {
-                    filename: "/tmp/main.c".to_string(),
-                    linenumber: 10,
+                .gdb_enable_breakpoint(Parameters(BreakpointTargetArgs {
+                    target: "1".to_string(),
+                }))
+                .await
+                .0,
+            server
+                .gdb_disable_breakpoint(Parameters(BreakpointTargetArgs {
+                    target: "1".to_string(),
                 }))
                 .await
                 .0,
             server.gdb_list_breakpoint().await.0,
+            server
+                .gdb_watch(Parameters(WatchArgs {
+                    expression: "counter".to_string(),
+                    mode: WatchKind::default(),
+                }))
+                .await
+                .0,
+            server
+                .gdb_examine_memory(Parameters(ExamineMemoryArgs {
+                    address: "&counter".to_string(),
+                    count: Some(4),
+                    format: None,
+                    size: None,
+                }))
+                .await
+                .0,
             server.gdb_next().await.0,
             server.gdb_step().await.0,
             server.gdb_continue().await.0,
+            server.gdb_finish().await.0,
+            server.gdb_nexti().await.0,
+            server.gdb_stepi().await.0,
             server.gdb_interrupt().await.0,
             server
                 .gdb_add_variable_list(Parameters(VariableArgs {
@@ -604,15 +803,7 @@ mod tests {
             server.gdb_info_threads().await.0,
             server
                 .gdb_print(Parameters(PrintArgs {
-                    var: "a".to_string(),
-                    value: None,
-                }))
-                .await
-                .0,
-            server
-                .gdb_print(Parameters(PrintArgs {
-                    var: "a".to_string(),
-                    value: Some("12".to_string()),
+                    expression: "a".to_string(),
                 }))
                 .await
                 .0,
@@ -627,19 +818,12 @@ mod tests {
             server.gdb_kill().await.0,
             server.gdb_reset_back_to_not_attached().await.0,
             server
-                .gdb_display_lines_before_current(Parameters(SizeArgs { size: 4 }))
-                .await
-                .0,
-            server
-                .gdb_display_lines_after_current(Parameters(SizeArgs { size: 5 }))
-                .await
-                .0,
-            server
-                .gdb_display_backtrace(Parameters(SizeArgs { size: 3 }))
-                .await
-                .0,
-            server
-                .gdb_display_variable_list(Parameters(SizeArgs { size: 2 }))
+                .gdb_set_display(Parameters(SetDisplayArgs {
+                    lines_before_current: Some(4),
+                    lines_after_current: Some(5),
+                    backtrace: Some(3),
+                    variable_list: Some(2),
+                }))
                 .await
                 .0,
             server
@@ -700,9 +884,9 @@ mod tests {
             .await;
 
         let response = server
-            .gdb_add_breakpoint(Parameters(BreakpointArgs {
-                filename: "/tmp/main.c".to_string(),
-                linenumber: 10,
+            .gdb_add_breakpoint(Parameters(BreakpointLocationArgs {
+                location: "/tmp/main.c:10".to_string(),
+                condition: None,
             }))
             .await
             .0;
@@ -758,8 +942,12 @@ mod tests {
             .await
             .0;
 
-        let var_list = response.variable_list.expect("variable_list should be present");
-        let step_value = var_list.get("step").expect("step should be in variable_list");
+        let var_list = response
+            .variable_list
+            .expect("variable_list should be present");
+        let step_value = var_list
+            .get("step")
+            .expect("step should be in variable_list");
         assert!(
             step_value.contains("<error:"),
             "out-of-scope variable should be indicated, got: {step_value}"
@@ -816,7 +1004,9 @@ mod tests {
             .await
             .0;
 
-        let output = response.command_output.expect("custom should return command_output");
+        let output = response
+            .command_output
+            .expect("custom should return command_output");
         assert!(
             output.contains("x = 10"),
             "command_output should contain gdb result, got: {output}"
@@ -827,7 +1017,10 @@ mod tests {
     async fn test_execute_with_full_snapshot_propagates_errors() {
         let handle = MockBackendHandle::with_default_response("Breakpoint 1 at 0x0");
         handle.set_response("run", "\nBreakpoint 1, main () at src/main.c:10\n");
-        handle.set_response("next", "Program received signal SIGSEGV, Segmentation fault.\n");
+        handle.set_response(
+            "next",
+            "Program received signal SIGSEGV, Segmentation fault.\n",
+        );
         handle.set_response("backtrace full", "#0 main\n");
         handle.set_response("frame", "#0 main at /tmp/main.c:10\n");
         handle.set_response("list 3,18", "10\tline10\n");
@@ -870,9 +1063,9 @@ mod tests {
             .await;
 
         let response = server
-            .gdb_add_breakpoint(Parameters(BreakpointArgs {
-                filename: "/tmp/main.c".to_string(),
-                linenumber: 10,
+            .gdb_add_breakpoint(Parameters(BreakpointLocationArgs {
+                location: "/tmp/main.c:10".to_string(),
+                condition: None,
             }))
             .await
             .0;
@@ -919,8 +1112,12 @@ mod tests {
             DebuggerState::StoppedAtBreakpoint
         );
 
-        let var_list = run_response.variable_list.expect("variable_list should be present");
-        let step_value = var_list.get("step").expect("step should be in variable_list");
+        let var_list = run_response
+            .variable_list
+            .expect("variable_list should be present");
+        let step_value = var_list
+            .get("step")
+            .expect("step should be in variable_list");
         assert_eq!(
             step_value, "0",
             "step should be 0 at breakpoint on first run, got: {step_value}"
@@ -1045,10 +1242,7 @@ mod tests {
     #[tokio::test]
     async fn test_info_regs_returns_not_attached_after_quit() {
         let handle = MockBackendHandle::with_default_response("Breakpoint 1 at 0x0");
-        handle.set_response(
-            "info all-registers",
-            "rax 0x1 1\n",
-        );
+        handle.set_response("info all-registers", "rax 0x1 1\n");
         let factory = Arc::new(MockGdbBackendFactory::new(handle));
         let server = OpenMcpGdbServer::new(test_config(), factory);
 
@@ -1090,7 +1284,9 @@ mod tests {
 
         let commands = handle.commands();
         assert!(
-            commands.iter().any(|cmd| cmd.starts_with("set variable counter = 42")),
+            commands
+                .iter()
+                .any(|cmd| cmd.starts_with("set variable counter = 42")),
             "set_var should send 'set variable' command to gdb, got: {:?}",
             commands
         );
@@ -1099,10 +1295,7 @@ mod tests {
     #[tokio::test]
     async fn test_info_regs_returns_base_on_exited_state() {
         let handle = MockBackendHandle::with_default_response("ok");
-        handle.set_response(
-            "info all-registers",
-            "rax 0x1 1\n",
-        );
+        handle.set_response("info all-registers", "rax 0x1 1\n");
         let factory = Arc::new(MockGdbBackendFactory::new(handle.clone()));
         let server = OpenMcpGdbServer::new(test_config(), factory);
 
@@ -1123,7 +1316,10 @@ mod tests {
             response.debugger_state
         );
         assert!(
-            !handle.commands().iter().any(|cmd| cmd == "info all-registers"),
+            !handle
+                .commands()
+                .iter()
+                .any(|cmd| cmd == "info all-registers"),
             "info_regs should NOT send gdb command when state is Exited, got: {:?}",
             handle.commands()
         );
@@ -1207,6 +1403,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_debugger_state_preserves_terminal_state_for_real_info_program_output() {
+        // Real gdb answers `info program` with "The program being debugged is
+        // not being run." *after* the inferior was killed too. The session must
+        // not collapse the terminal SigKill state back to Attached.
+        let handle = MockBackendHandle::with_default_response("ok");
+        handle.set_response("kill", "[Inferior 1 (process 123) killed]\n");
+        handle.set_response(
+            "info program",
+            "The program being debugged is not being run.\n",
+        );
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .gdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let kill_response = server.gdb_kill().await.0;
+        assert_eq!(kill_response.debugger_state, DebuggerState::SigKill);
+
+        let state_response = server.gdb_debugger_state().await.0;
+        assert_eq!(
+            state_response.debugger_state,
+            DebuggerState::SigKill,
+            "terminal sigkill state should survive a real info program 'not being run' response"
+        );
+    }
+
+    #[tokio::test]
     async fn test_run_does_not_auto_attach_when_not_attached() {
         let handle = MockBackendHandle::with_default_response("ok");
         let factory = Arc::new(MockGdbBackendFactory::new(handle.clone()));
@@ -1285,7 +1512,10 @@ mod tests {
     #[tokio::test]
     async fn test_custom_invalid_command_sets_error_state() {
         let handle = MockBackendHandle::with_default_response("ok");
-        handle.set_response("invalid cmd", "Undefined command: \"invalid\". Try \"help\".\n");
+        handle.set_response(
+            "invalid cmd",
+            "Undefined command: \"invalid\". Try \"help\".\n",
+        );
         let factory = Arc::new(MockGdbBackendFactory::new(handle));
         let server = OpenMcpGdbServer::new(test_config(), factory);
 
@@ -1308,8 +1538,151 @@ mod tests {
             "invalid custom command should set error state"
         );
         assert!(
-            response.error.to_ascii_lowercase().contains("undefined command"),
+            response
+                .error
+                .to_ascii_lowercase()
+                .contains("undefined command"),
             "error should include gdb invalid-command output"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_finish_at_outermost_frame_reports_recoverable_error() {
+        let handle = MockBackendHandle::with_default_response("ok");
+        handle.set_response(
+            "finish",
+            "\u{274c}\u{fe0f} \"finish\" not meaningful in the outermost frame.\n",
+        );
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .gdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let response = server.gdb_finish().await.0;
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::Error,
+            "outermost-frame finish should surface gdb's refusal, got: {:?}",
+            response.debugger_state
+        );
+        assert!(
+            response.error.contains("not meaningful"),
+            "error should include gdb's explanation: {response:?}"
+        );
+
+        // A later successful command clears the latched error state.
+        let recovered = server.gdb_info_threads().await.0.debugger_state;
+        assert_ne!(
+            recovered,
+            DebuggerState::Error,
+            "a succeeding command should recover the stale error"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_target_remote_without_executable_gives_guidance() {
+        let handle = MockBackendHandle::with_default_response("ok");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let mut config = test_config();
+        config.executable_path = "".into();
+        let server = OpenMcpGdbServer::new(config, factory);
+
+        let response = server
+            .gdb_target_remote(Parameters(TargetRemoteArgs {
+                ip: "127.0.0.1".to_string(),
+                port: 1234,
+            }))
+            .await
+            .0;
+
+        assert_eq!(response.debugger_state, DebuggerState::FailedToAttach);
+        assert!(
+            response.error.contains("gdb_execute"),
+            "error should tell the client what to do instead: {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attach_and_detach_lifecycle() {
+        let handle = MockBackendHandle::with_default_response("ok");
+        handle.set_response(
+            "attach 4242",
+            "Attaching to process 4242\n0x00007f... in ?? ()\n",
+        );
+        handle.set_response(
+            "detach",
+            "Detaching from program: , process 4242\n[Inferior 1 (process 4242) detached]\n",
+        );
+        let factory = Arc::new(MockGdbBackendFactory::new(handle.clone()));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let attach = server.gdb_attach(Parameters(PidArgs { pid: 4242 })).await.0;
+        assert_eq!(attach.debugger_state, DebuggerState::Attached);
+        assert!(
+            attach
+                .command_output
+                .unwrap_or_default()
+                .contains("Attaching to process 4242")
+        );
+
+        // Debugger is usable afterwards: state query reflects attached.
+        let state = server.gdb_debugger_state().await.0;
+        assert_eq!(state.debugger_state, DebuggerState::Attached);
+
+        let detach = server.gdb_detach().await.0;
+        assert_eq!(detach.debugger_state, DebuggerState::NotAttached);
+
+        // After detach the session reports not attached.
+        let after = server.gdb_debugger_state().await.0;
+        assert_eq!(after.debugger_state, DebuggerState::NotAttached);
+    }
+
+    #[tokio::test]
+    async fn test_attach_rejects_nonpositive_pid() {
+        let handle = MockBackendHandle::with_default_response("ok");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let response = server.gdb_attach(Parameters(PidArgs { pid: 0 })).await.0;
+        assert_eq!(response.debugger_state, DebuggerState::FailedToAttach);
+        assert!(response.error.contains("pid must be > 0"));
+    }
+
+    #[tokio::test]
+    async fn test_disassemble_passes_address_through() {
+        let handle = MockBackendHandle::with_default_response(
+            "Dump of assembler code for function main:\n0x1155 <+0>: endbr64\nEnd of assembler dump.\n",
+        );
+        let factory = Arc::new(MockGdbBackendFactory::new(handle.clone()));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .gdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let response = server
+            .gdb_disassemble(Parameters(DisassembleArgs {
+                address: Some("main".to_string()),
+            }))
+            .await
+            .0;
+        assert!(
+            handle
+                .commands()
+                .iter()
+                .any(|cmd| cmd == "disassemble main")
+        );
+        assert!(
+            response
+                .command_output
+                .unwrap_or_default()
+                .contains("Dump of assembler code")
         );
     }
 
@@ -1337,6 +1710,7 @@ mod tests {
     #[tokio::test]
     async fn test_gdb_interrupt_returns_stopped_with_full_snapshot() {
         let (server, handle) = test_server_with_mock();
+        handle.set_response("continue", "Continuing.\n");
 
         let _ = server
             .gdb_execute(Parameters(ExecuteArgs {
@@ -1350,12 +1724,14 @@ mod tests {
             }))
             .await;
 
+        // Interrupt only makes sense when the inferior is actually running.
+        let _ = server.gdb_continue().await;
         let response = server.gdb_interrupt().await.0;
 
         assert_eq!(
             response.debugger_state,
             DebuggerState::StoppedAtStepping,
-            "gdb_interrupt should move session into stopped-at-stepping"
+            "gdb_interrupt should move a running session into stopped-at-stepping"
         );
         assert!(
             response.variable_list.is_some(),
@@ -1382,6 +1758,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_interrupt_while_stopped_is_noop_and_preserves_breakpoint_stop() {
+        let handle = MockBackendHandle::with_default_response("ok");
+        handle.set_response("run", "Breakpoint 1, main () at src/main.c:10\n");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .gdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let _ = server.gdb_run().await;
+        let response = server.gdb_interrupt().await.0;
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::StoppedAtBreakpoint,
+            "interrupt should not rewrite the stop attribution of an already-stopped inferior"
+        );
+        assert_eq!(response.stop_reason, Some("breakpoint 1".to_string()));
+    }
+
+    #[tokio::test]
     async fn test_gdb_interrupt_when_not_attached_returns_base_state() {
         let (server, _) = test_server_with_mock();
 
@@ -1399,7 +1798,10 @@ mod tests {
     #[tokio::test]
     async fn test_unhandled_signal_sets_error_and_persists() {
         let handle = MockBackendHandle::with_default_response("ok");
-        handle.set_response("next", "Program received signal SIGUSR1, User defined signal 1.\n");
+        handle.set_response(
+            "next",
+            "Program received signal SIGUSR1, User defined signal 1.\n",
+        );
         let factory = Arc::new(MockGdbBackendFactory::new(handle));
         let server = OpenMcpGdbServer::new(test_config(), factory);
 
@@ -1469,7 +1871,10 @@ mod tests {
     #[tokio::test]
     async fn test_breakpoint_word_in_non_stop_output_does_not_flip_state() {
         let handle = MockBackendHandle::with_default_response("ok");
-        handle.set_response("info files", "Symbols loaded for breakpoint_table helper.\n");
+        handle.set_response(
+            "info files",
+            "Symbols loaded for breakpoint_table helper.\n",
+        );
         let factory = Arc::new(MockGdbBackendFactory::new(handle));
         let server = OpenMcpGdbServer::new(test_config(), factory);
 
@@ -1511,10 +1916,7 @@ mod tests {
 
         let reset = server.gdb_reset_back_to_not_attached().await.0;
         assert_eq!(reset.debugger_state, DebuggerState::NotAttached);
-        assert!(
-            reset.error.is_empty(),
-            "reset should clear last error"
-        );
+        assert!(reset.error.is_empty(), "reset should clear last error");
 
         let state = server.gdb_debugger_state().await.0;
         assert_eq!(state.debugger_state, DebuggerState::NotAttached);
@@ -1597,8 +1999,7 @@ mod tests {
 
         let response = server
             .gdb_print(Parameters(PrintArgs {
-                var: "this_var_does_not_exist".to_string(),
-                value: None,
+                expression: "this_var_does_not_exist".to_string(),
             }))
             .await
             .0;
@@ -1606,6 +2007,43 @@ mod tests {
         assert_eq!(response.debugger_state, DebuggerState::Attached);
         assert!(response.error.to_ascii_lowercase().contains("no symbol"));
 
+        let state = server.gdb_debugger_state().await.0;
+        assert_eq!(state.debugger_state, DebuggerState::Attached);
+    }
+
+    #[tokio::test]
+    async fn test_print_value_containing_error_colon_is_not_treated_as_gdb_error() {
+        let handle = MockBackendHandle::with_default_response("ok");
+        handle.set_response("print \"no error: here\"", "$1 = \"no error: here\"\n");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle.clone()));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .gdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let response = server
+            .gdb_print(Parameters(PrintArgs {
+                expression: "\"no error: here\"".to_string(),
+            }))
+            .await
+            .0;
+
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::Attached,
+            "a benign value containing 'error:' must not flip the session to Error"
+        );
+        assert!(
+            response.error.is_empty(),
+            "error field should not be populated for a benign value: {:?}",
+            response.error
+        );
+
+        // The session must stay usable: a subsequent real gdb error is still
+        // detected, and a follow-up successful call recovers.
         let state = server.gdb_debugger_state().await.0;
         assert_eq!(state.debugger_state, DebuggerState::Attached);
     }
@@ -1656,7 +2094,12 @@ mod tests {
             .0;
 
         assert_eq!(response.debugger_state, DebuggerState::Attached);
-        assert!(response.error.to_ascii_lowercase().contains("no frame at level"));
+        assert!(
+            response
+                .error
+                .to_ascii_lowercase()
+                .contains("no frame at level")
+        );
 
         let state = server.gdb_debugger_state().await.0;
         assert_eq!(state.debugger_state, DebuggerState::Attached);
@@ -1681,7 +2124,12 @@ mod tests {
             .0;
 
         assert_eq!(response.debugger_state, DebuggerState::Attached);
-        assert!(response.error.to_ascii_lowercase().contains("unknown thread"));
+        assert!(
+            response
+                .error
+                .to_ascii_lowercase()
+                .contains("unknown thread")
+        );
 
         let state = server.gdb_debugger_state().await.0;
         assert_eq!(state.debugger_state, DebuggerState::Attached);
@@ -1704,15 +2152,20 @@ mod tests {
             .await;
 
         let response = server
-            .gdb_add_breakpoint(Parameters(BreakpointArgs {
-                filename: "/tmp/does_not_exist.c".to_string(),
-                linenumber: 1,
+            .gdb_add_breakpoint(Parameters(BreakpointLocationArgs {
+                location: "/tmp/does_not_exist.c:1".to_string(),
+                condition: None,
             }))
             .await
             .0;
 
         assert_eq!(response.debugger_state, DebuggerState::Attached);
-        assert!(response.error.to_ascii_lowercase().contains("no source file named"));
+        assert!(
+            response
+                .error
+                .to_ascii_lowercase()
+                .contains("no source file named")
+        );
 
         let state = server.gdb_debugger_state().await.0;
         assert_eq!(state.debugger_state, DebuggerState::Attached);
@@ -1721,7 +2174,10 @@ mod tests {
     #[tokio::test]
     async fn test_bug_7_clear_breakpoint_invalid_location_maps_to_error() {
         let handle = MockBackendHandle::with_default_response("ok");
-        handle.set_response("clear /tmp/main.c:9999", "No breakpoint at /tmp/main.c:9999.\n");
+        handle.set_response(
+            "clear /tmp/main.c:9999",
+            "No breakpoint at /tmp/main.c:9999.\n",
+        );
         let factory = Arc::new(MockGdbBackendFactory::new(handle));
         let server = OpenMcpGdbServer::new(test_config(), factory);
 
@@ -1732,9 +2188,8 @@ mod tests {
             .await;
 
         let response = server
-            .gdb_clear_breakpoint(Parameters(BreakpointArgs {
-                filename: "/tmp/main.c".to_string(),
-                linenumber: 9999,
+            .gdb_clear_breakpoint(Parameters(BreakpointTargetArgs {
+                target: "/tmp/main.c:9999".to_string(),
             }))
             .await
             .0;
@@ -1757,7 +2212,12 @@ mod tests {
 
         let response = server.gdb_info_threads().await.0;
         assert_eq!(response.debugger_state, DebuggerState::Attached);
-        assert!(response.error.to_ascii_lowercase().contains("unknown thread"));
+        assert!(
+            response
+                .error
+                .to_ascii_lowercase()
+                .contains("unknown thread")
+        );
 
         let state = server.gdb_debugger_state().await.0;
         assert_eq!(state.debugger_state, DebuggerState::Attached);
@@ -1766,7 +2226,10 @@ mod tests {
     #[tokio::test]
     async fn test_bug_8_disable_breakpoint_invalid_location_maps_to_error() {
         let handle = MockBackendHandle::with_default_response("ok");
-        handle.set_response("info breakpoints", "No breakpoints, watchpoints, tracepoints, or catchpoints.\n");
+        handle.set_response(
+            "info breakpoints",
+            "No breakpoints, watchpoints, tracepoints, or catchpoints.\n",
+        );
         let factory = Arc::new(MockGdbBackendFactory::new(handle));
         let server = OpenMcpGdbServer::new(test_config(), factory);
 
@@ -1777,21 +2240,23 @@ mod tests {
             .await;
 
         let response = server
-            .gdb_disable_breakpoint(Parameters(BreakpointArgs {
-                filename: "/tmp/main.c".to_string(),
-                linenumber: 9999,
+            .gdb_disable_breakpoint(Parameters(BreakpointTargetArgs {
+                target: "/tmp/main.c:9999".to_string(),
             }))
             .await
             .0;
 
         assert_eq!(response.debugger_state, DebuggerState::Error);
-        assert!(response.error.contains("No breakpoint at /tmp/main.c:9999"));
+        assert!(response.error.contains("no breakpoint matching"));
     }
 
     #[tokio::test]
     async fn test_bug_9_enable_breakpoint_invalid_location_maps_to_error() {
         let handle = MockBackendHandle::with_default_response("ok");
-        handle.set_response("info breakpoints", "No breakpoints, watchpoints, tracepoints, or catchpoints.\n");
+        handle.set_response(
+            "info breakpoints",
+            "No breakpoints, watchpoints, tracepoints, or catchpoints.\n",
+        );
         let factory = Arc::new(MockGdbBackendFactory::new(handle));
         let server = OpenMcpGdbServer::new(test_config(), factory);
 
@@ -1802,15 +2267,14 @@ mod tests {
             .await;
 
         let response = server
-            .gdb_enable_breakpoint(Parameters(BreakpointArgs {
-                filename: "/tmp/main.c".to_string(),
-                linenumber: 9999,
+            .gdb_enable_breakpoint(Parameters(BreakpointTargetArgs {
+                target: "/tmp/main.c:9999".to_string(),
             }))
             .await
             .0;
 
         assert_eq!(response.debugger_state, DebuggerState::Error);
-        assert!(response.error.contains("No breakpoint at /tmp/main.c:9999"));
+        assert!(response.error.contains("no breakpoint matching"));
     }
 
     #[tokio::test]
@@ -1833,9 +2297,8 @@ mod tests {
             .await;
 
         let response = server
-            .gdb_disable_breakpoint(Parameters(BreakpointArgs {
-                filename: "/tmp/src/main.c".to_string(),
-                linenumber: 55,
+            .gdb_disable_breakpoint(Parameters(BreakpointTargetArgs {
+                target: "/tmp/src/main.c:55".to_string(),
             }))
             .await
             .0;
@@ -1871,9 +2334,8 @@ mod tests {
             .await;
 
         let response = server
-            .gdb_enable_breakpoint(Parameters(BreakpointArgs {
-                filename: "/tmp/src/main.c".to_string(),
-                linenumber: 55,
+            .gdb_enable_breakpoint(Parameters(BreakpointTargetArgs {
+                target: "/tmp/src/main.c:55".to_string(),
             }))
             .await
             .0;
@@ -1967,7 +2429,10 @@ mod tests {
     #[tokio::test]
     async fn test_bug_1_running_info_threads_interrupts_and_returns_clean_output() {
         let handle = MockBackendHandle::with_default_response("ok");
-        handle.set_response("info threads", "  Id   Target Id         Frame\n* 1    Thread 0x1 main\n");
+        handle.set_response(
+            "info threads",
+            "  Id   Target Id         Frame\n* 1    Thread 0x1 main\n",
+        );
         let factory = Arc::new(MockGdbBackendFactory::new(handle.clone()));
         let server = OpenMcpGdbServer::new(test_config(), factory);
 
@@ -1988,6 +2453,46 @@ mod tests {
         assert!(
             commands.iter().any(|cmd| cmd == "printf \"\""),
             "running-state query should resync after interrupt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_full_backtrace_while_running_interrupts_before_snapshot() {
+        let handle = MockBackendHandle::with_default_response("ok");
+        handle.set_response("backtrace full", "#0 main () at /tmp/main.c:10\n");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle.clone()));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .gdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let _ = server.gdb_continue().await;
+
+        let response = server.gdb_full_backtrace().await.0;
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::StoppedAtStepping,
+            "full_backtrace on a running inferior should interrupt and report the stopped state"
+        );
+        assert!(
+            response
+                .backtrace
+                .as_ref()
+                .is_some_and(|bt| bt.contains_key("0")),
+            "full_backtrace should still return the collected frames"
+        );
+
+        let commands = handle.commands();
+        let bt_index = commands
+            .iter()
+            .position(|cmd| cmd == "backtrace full")
+            .expect("backtrace full should be sent");
+        assert!(
+            commands[..bt_index].iter().any(|cmd| cmd == "printf \"\""),
+            "full_backtrace should interrupt and resync before querying while running"
         );
     }
 
@@ -2102,8 +2607,7 @@ mod tests {
 
         let recover = server
             .gdb_print(Parameters(PrintArgs {
-                var: "a".to_string(),
-                value: None,
+                expression: "a".to_string(),
             }))
             .await
             .0;
@@ -2139,9 +2643,7 @@ mod tests {
             .rposition(|cmd| cmd == "print a")
             .expect("print a should be executed");
         assert!(
-            commands[..print_idx]
-                .iter()
-                .any(|cmd| cmd == "printf \"\""),
+            commands[..print_idx].iter().any(|cmd| cmd == "printf \"\""),
             "variable_list should resync before print while running"
         );
     }
@@ -2153,31 +2655,56 @@ mod tests {
         let server = OpenMcpGdbServer::new(test_config(), factory);
 
         let before = server
-            .gdb_display_lines_before_current(Parameters(SizeArgs { size: 0 }))
+            .gdb_set_display(Parameters(SetDisplayArgs {
+                lines_before_current: Some(0),
+                lines_after_current: None,
+                backtrace: None,
+                variable_list: None,
+            }))
             .await
             .0;
         assert_eq!(before.debugger_state, DebuggerState::Error);
 
         let after = server
-            .gdb_display_lines_after_current(Parameters(SizeArgs { size: 0 }))
+            .gdb_set_display(Parameters(SetDisplayArgs {
+                lines_before_current: None,
+                lines_after_current: Some(0),
+                backtrace: None,
+                variable_list: None,
+            }))
             .await
             .0;
         assert_eq!(after.debugger_state, DebuggerState::Error);
 
         let bt = server
-            .gdb_display_backtrace(Parameters(SizeArgs { size: 0 }))
+            .gdb_set_display(Parameters(SetDisplayArgs {
+                lines_before_current: None,
+                lines_after_current: None,
+                backtrace: Some(0),
+                variable_list: None,
+            }))
             .await
             .0;
         assert_eq!(bt.debugger_state, DebuggerState::Error);
 
         let vars = server
-            .gdb_display_variable_list(Parameters(SizeArgs { size: 0 }))
+            .gdb_set_display(Parameters(SetDisplayArgs {
+                lines_before_current: None,
+                lines_after_current: None,
+                backtrace: None,
+                variable_list: Some(0),
+            }))
             .await
             .0;
         assert_eq!(vars.debugger_state, DebuggerState::Error);
 
         let recover = server
-            .gdb_display_variable_list(Parameters(SizeArgs { size: 3 }))
+            .gdb_set_display(Parameters(SetDisplayArgs {
+                lines_before_current: None,
+                lines_after_current: None,
+                backtrace: None,
+                variable_list: Some(3),
+            }))
             .await
             .0;
         assert_eq!(
@@ -2185,7 +2712,10 @@ mod tests {
             DebuggerState::NotAttached,
             "valid display setter should recover stale error without reset"
         );
-        assert!(recover.error.is_empty(), "error should be cleared after recovery");
+        assert!(
+            recover.error.is_empty(),
+            "error should be cleared after recovery"
+        );
     }
 
     #[tokio::test]
@@ -2231,9 +2761,7 @@ mod tests {
             .position(|cmd| cmd == "frame")
             .expect("frame should be executed");
         assert!(
-            commands[..frame_idx]
-                .iter()
-                .any(|cmd| cmd == "printf \"\""),
+            commands[..frame_idx].iter().any(|cmd| cmd == "printf \"\""),
             "current_code should resync before frame while running"
         );
     }

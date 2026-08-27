@@ -1,18 +1,23 @@
 use anyhow::Result;
-use openmcpgdb::{
-    ServerConfig,
-    gdb::RealGdbBackendFactory,
-    server::OpenMcpGdbServerFactory,
-};
+use openmcpgdb::{ServerConfig, gdb::RealGdbBackendFactory, server::OpenMcpGdbServerFactory};
 use rmcp::{
     ClientHandler, ServiceExt,
-    model::{CallToolRequestParams, ClientInfo, RawContent},
+    model::{CallToolRequestParams, ClientInfo, ContentBlock},
 };
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio::process::Command;
 
-const MAZE_CODEBASE_DIR: &str = "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot";
-const MAZE_BINARY_PATH: &str = "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot";
+fn maze_codebase_dir() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/mazerobot")
+}
+
+fn maze_binary_path() -> std::path::PathBuf {
+    maze_codebase_dir().join("maze_robot")
+}
+
+fn maze_main_c() -> std::path::PathBuf {
+    maze_codebase_dir().join("src/main.c")
+}
 
 #[derive(Debug, Clone, Default)]
 struct MazeTestClient;
@@ -27,8 +32,9 @@ fn mazerobot_config() -> ServerConfig {
     ServerConfig {
         gdb_path: "/usr/bin/gdb".into(),
         gdb_options: String::new(),
-        codebase_dir: MAZE_CODEBASE_DIR.into(),
-        executable_path: MAZE_BINARY_PATH.into(),
+        gdbserver_path: "gdbserver".into(),
+        codebase_dir: maze_codebase_dir(),
+        executable_path: maze_binary_path(),
         mcp_server_name: "MCP GDB Server".to_string(),
         mcp_server_url: "https://localhost:9443".to_string(),
         display_lines_before_current: 7,
@@ -41,18 +47,31 @@ fn mazerobot_config() -> ServerConfig {
 
 fn has_required_paths() -> bool {
     Path::new("/usr/bin/gdb").exists()
-        && Path::new(MAZE_CODEBASE_DIR).exists()
-        && Path::new(MAZE_BINARY_PATH).exists()
+        && maze_codebase_dir().exists()
+        && maze_binary_path().exists()
 }
 
 async fn ensure_mazerobot_executable() -> Result<()> {
+    // Ensure the binary's DWARF comp_dir matches the current checkout path.
+    // The committed binary was built at /home/brosnan/...; rebuild so absolute
+    // breakpoint locations (maze_main_c():55) match the debug info.
+    let _ = Command::new("make")
+        .arg("-C")
+        .arg(maze_codebase_dir())
+        .arg("-B")
+        .status()
+        .await;
+
     let status = Command::new("chmod")
         .arg("+x")
-        .arg("./examples/mazerobot/maze_robot")
+        .arg(maze_binary_path())
         .status()
         .await?;
 
-    anyhow::ensure!(status.success(), "chmod +x ./examples/mazerobot/maze_robot failed");
+    anyhow::ensure!(
+        status.success(),
+        "chmod +x ./examples/mazerobot/maze_robot failed"
+    );
     Ok(())
 }
 
@@ -65,7 +84,7 @@ async fn test_mcp_server_with_mazerobot_binary() -> Result<()> {
 
     ensure_mazerobot_executable().await?;
 
-    let config = mazerobot_config();
+    let mut config = mazerobot_config();
     config.validate()?;
 
     let factory = OpenMcpGdbServerFactory::new(config, Arc::new(RealGdbBackendFactory));
@@ -86,10 +105,11 @@ async fn test_mcp_server_with_mazerobot_binary() -> Result<()> {
         "gdb_execute tool should be registered"
     );
 
+    let binary = maze_binary_path().display().to_string();
     let execute_result = client
         .call_tool(
             CallToolRequestParams::new("gdb_execute").with_arguments(
-                serde_json::json!({ "executable_path": MAZE_BINARY_PATH })
+                serde_json::json!({ "executable_path": binary })
                     .as_object()
                     .expect("execute args should be object")
                     .clone(),
@@ -128,10 +148,10 @@ fn parse_debugger_response(result: &rmcp::model::CallToolResult) -> serde_json::
     }
 
     for item in &result.content {
-        if let RawContent::Text(text) = &item.raw {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text.text) {
-                return value;
-            }
+        if let ContentBlock::Text(text) = item
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text.text)
+        {
+            return value;
         }
     }
 
@@ -141,13 +161,15 @@ fn parse_debugger_response(result: &rmcp::model::CallToolResult) -> serde_json::
 #[tokio::test]
 async fn test_bug_invalid_print_symbol_is_recoverable_without_reset() -> Result<()> {
     if !has_required_paths() {
-        eprintln!("Skipping test_bug_invalid_print_symbol_is_recoverable_without_reset: required paths missing");
+        eprintln!(
+            "Skipping test_bug_invalid_print_symbol_is_recoverable_without_reset: required paths missing"
+        );
         return Ok(());
     }
 
     ensure_mazerobot_executable().await?;
 
-    let config = mazerobot_config();
+    let mut config = mazerobot_config();
     config.validate()?;
 
     let factory = OpenMcpGdbServerFactory::new(config, Arc::new(RealGdbBackendFactory));
@@ -162,10 +184,12 @@ async fn test_bug_invalid_print_symbol_is_recoverable_without_reset() -> Result<
 
     let client = MazeTestClient.serve(client_transport).await?;
 
+    let binary = maze_binary_path().display().to_string();
+    let breakpoint_loc = format!("{}:55", maze_main_c().display());
     let execute_result = client
         .call_tool(
             CallToolRequestParams::new("gdb_execute").with_arguments(
-                serde_json::json!({ "executable_path": MAZE_BINARY_PATH })
+                serde_json::json!({ "executable_path": binary })
                     .as_object()
                     .expect("execute args should be object")
                     .clone(),
@@ -178,8 +202,7 @@ async fn test_bug_invalid_print_symbol_is_recoverable_without_reset() -> Result<
         .call_tool(
             CallToolRequestParams::new("gdb_add_breakpoint").with_arguments(
                 serde_json::json!({
-                    "filename": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c",
-                    "linenumber": 55
+                    "location": breakpoint_loc
                 })
                 .as_object()
                 .expect("breakpoint args should be object")
@@ -197,7 +220,7 @@ async fn test_bug_invalid_print_symbol_is_recoverable_without_reset() -> Result<
     let bad_print_result = client
         .call_tool(
             CallToolRequestParams::new("gdb_print").with_arguments(
-                serde_json::json!({ "var": "this_var_does_not_exist_anywhere" })
+                serde_json::json!({ "expression": "this_var_does_not_exist_anywhere" })
                     .as_object()
                     .expect("print args should be object")
                     .clone(),
@@ -248,13 +271,15 @@ async fn test_bug_invalid_print_symbol_is_recoverable_without_reset() -> Result<
 #[tokio::test]
 async fn test_bug_continue_while_running_returns_running_state() -> Result<()> {
     if !has_required_paths() {
-        eprintln!("Skipping test_bug_continue_while_running_returns_running_state: required paths missing");
+        eprintln!(
+            "Skipping test_bug_continue_while_running_returns_running_state: required paths missing"
+        );
         return Ok(());
     }
 
     ensure_mazerobot_executable().await?;
 
-    let config = mazerobot_config();
+    let mut config = mazerobot_config();
     config.validate()?;
 
     let factory = OpenMcpGdbServerFactory::new(config, Arc::new(RealGdbBackendFactory));
@@ -269,10 +294,12 @@ async fn test_bug_continue_while_running_returns_running_state() -> Result<()> {
 
     let client = MazeTestClient.serve(client_transport).await?;
 
+    let binary = maze_binary_path().display().to_string();
+    let breakpoint_loc = format!("{}:55", maze_main_c().display());
     let execute_result = client
         .call_tool(
             CallToolRequestParams::new("gdb_execute").with_arguments(
-                serde_json::json!({ "executable_path": MAZE_BINARY_PATH })
+                serde_json::json!({ "executable_path": binary })
                     .as_object()
                     .expect("execute args should be object")
                     .clone(),
@@ -285,8 +312,7 @@ async fn test_bug_continue_while_running_returns_running_state() -> Result<()> {
         .call_tool(
             CallToolRequestParams::new("gdb_add_breakpoint").with_arguments(
                 serde_json::json!({
-                    "filename": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c",
-                    "linenumber": 55
+                    "location": breakpoint_loc
                 })
                 .as_object()
                 .expect("breakpoint args should be object")
@@ -305,8 +331,7 @@ async fn test_bug_continue_while_running_returns_running_state() -> Result<()> {
         .call_tool(
             CallToolRequestParams::new("gdb_clear_breakpoint").with_arguments(
                 serde_json::json!({
-                    "filename": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c",
-                    "linenumber": 55
+                    "target": breakpoint_loc
                 })
                 .as_object()
                 .expect("clear args should be object")
