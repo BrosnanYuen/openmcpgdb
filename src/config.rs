@@ -133,6 +133,16 @@ impl ServerConfig {
         if !self.executable_path.as_os_str().is_empty() {
             self.executable_path = make_absolute(&self.executable_path)?;
         }
+        if self.display_lines_before_current == 0 {
+            return Err(OpenMcpGdbError::InvalidConfig(
+                "display_lines_before_current must be > 0".to_string(),
+            ));
+        }
+        if self.display_lines_after_current == 0 {
+            return Err(OpenMcpGdbError::InvalidConfig(
+                "display_lines_after_current must be > 0".to_string(),
+            ));
+        }
         if self.display_backtrace == 0 {
             return Err(OpenMcpGdbError::InvalidConfig(
                 "display_backtrace must be > 0".to_string(),
@@ -145,6 +155,34 @@ impl ServerConfig {
         }
         Ok(())
     }
+}
+
+/// Split a `gdb_options` string into arguments, honoring single and double
+/// quotes so options like `-ex "set pagination off"` stay intact instead of
+/// being split into words.
+pub(crate) fn split_gdb_options(input: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    for c in input.chars() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => current.push(c),
+            None => match c {
+                '\'' | '"' => quote = Some(c),
+                c if c.is_whitespace() => {
+                    if !current.is_empty() {
+                        args.push(std::mem::take(&mut current));
+                    }
+                }
+                _ => current.push(c),
+            },
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+    args
 }
 
 /// Resolve the gdb binary: absolute/relative paths are checked for existence,
@@ -443,5 +481,27 @@ mod tests {
         let mut config = valid_config_with_stub_gdb(&dir);
         config.display_variable_list = 0;
         assert!(config.validate().is_err());
+
+        let mut config = valid_config_with_stub_gdb(&dir);
+        config.display_lines_before_current = 0;
+        assert!(config.validate().is_err());
+
+        let mut config = valid_config_with_stub_gdb(&dir);
+        config.display_lines_after_current = 0;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn split_gdb_options_handles_quoted_arguments() {
+        // Quoted groups stay intact; unquoted words split on whitespace.
+        let args = split_gdb_options(r#"-ex "set pagination off" -batch"#);
+        assert_eq!(args, vec!["-ex", "set pagination off", "-batch"]);
+    }
+
+    #[test]
+    fn split_gdb_options_handles_single_quotes_and_empty_input() {
+        assert_eq!(split_gdb_options("'' -x 'a b'"), vec!["-x", "a b"]);
+        assert!(split_gdb_options("").is_empty());
+        assert!(split_gdb_options("   ").is_empty());
     }
 }

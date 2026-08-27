@@ -217,6 +217,9 @@ struct SessionCore<'a> {
     watched_variables: Vec<String>,
     executable_path: Option<PathBuf>,
     gdbserver_child: Option<tokio::process::Child>,
+    /// Background tasks that drain gdbserver's stdout/stderr pipes so a
+    /// 64KB pipe buffer fill cannot block the inferior. Aborted on stop.
+    gdbserver_tasks: Vec<tokio::task::JoinHandle<()>>,
     last_error: String,
     /// True after a successful `target remote` / `extended-remote` until quit/detach/reset.
     is_remote: bool,
@@ -275,6 +278,24 @@ impl<'a> SessionCore<'a> {
         }
     }
 
+    /// True when the inferior process has ended (exited, or killed by a
+    /// signal). `info program` answers "not being run" in that case too, so
+    /// gdb_debugger_state must not collapse these terminal states to Attached.
+    fn is_dead_or_exited_state(state: DebuggerState) -> bool {
+        matches!(
+            state,
+            DebuggerState::Exited
+                | DebuggerState::SigSegv
+                | DebuggerState::SigAbrt
+                | DebuggerState::SigBus
+                | DebuggerState::SigFpe
+                | DebuggerState::SigIll
+                | DebuggerState::SigTrap
+                | DebuggerState::SigTerm
+                | DebuggerState::SigKill
+        )
+    }
+
     fn new(config: ServerConfig, backend: &'a mut Box<dyn GdbBackend>) -> Self {
         Self {
             config,
@@ -284,6 +305,7 @@ impl<'a> SessionCore<'a> {
             watched_variables: Vec::new(),
             executable_path: None,
             gdbserver_child: None,
+            gdbserver_tasks: Vec::new(),
             last_error: String::new(),
             is_remote: false,
         }
@@ -292,14 +314,14 @@ impl<'a> SessionCore<'a> {
     async fn execute(&mut self, operation: ToolOperation) -> Result<DebuggerResponse> {
         match operation {
             ToolOperation::Execute { executable_path } => {
-                println!(
+                eprintln!(
                     "[gdb_execute] requested executable_path={}",
                     executable_path
                 );
                 self.execute_attach(executable_path).await
             }
             ToolOperation::Run => {
-                println!("[gdb_run] requested");
+                eprintln!("[gdb_run] requested");
                 self.execute_run().await
             }
             ToolOperation::GdbServer { ip, port, pid } => {
@@ -547,7 +569,11 @@ impl<'a> SessionCore<'a> {
             return Ok(response);
         }
 
-        let recovered_state = if previous_state == DebuggerState::Error {
+        let recovered_state = if previous_state == DebuggerState::Running {
+            // A recoverable command issued while the inferior was running has
+            // already interrupted it, so the inferior is actually stopped now.
+            DebuggerState::StoppedAtStepping
+        } else if previous_state == DebuggerState::Error {
             self.recoverable_base_state()
         } else {
             previous_state
@@ -582,7 +608,8 @@ impl<'a> SessionCore<'a> {
                 self.debugger_state = DebuggerState::Attached;
                 self.is_remote = false;
                 self.last_error.clear();
-                println!("[gdb_execute] success: gdb started for {}", executable_path);
+                self.stop_reason = None;
+                eprintln!("[gdb_execute] success: gdb started for {}", executable_path);
                 Ok(self.base_response())
             }
             Err(err) => {
@@ -660,7 +687,7 @@ impl<'a> SessionCore<'a> {
                     self.last_error.clear();
                 }
                 if command == "run" {
-                    println!(
+                    eprintln!(
                         "[gdb_run] success: debugger_state={:?}, gdb_output={}",
                         self.debugger_state,
                         output.trim()
@@ -696,7 +723,12 @@ impl<'a> SessionCore<'a> {
 
         // Printing a symbol out of scope should be recoverable: keep session state and return
         // the command error text without forcing a global debugger error latch.
-        let recovered_state = if previous_state == DebuggerState::Error {
+        let recovered_state = if previous_state == DebuggerState::Running {
+            // Attempting a print while the inferior is running interrupts it
+            // (via the resync in execute_command_internal), so the inferior is
+            // actually stopped now. Do not report the stale Running status.
+            DebuggerState::StoppedAtStepping
+        } else if previous_state == DebuggerState::Error {
             if self.executable_path.is_some() {
                 DebuggerState::Attached
             } else {
@@ -1156,6 +1188,8 @@ impl<'a> SessionCore<'a> {
                         .await;
                 stderr_buf = String::from_utf8_lossy(&buf).trim().to_string();
             }
+            // Reap the exited child so it does not linger as a zombie.
+            let _ = child.wait().await;
             self.debugger_state = DebuggerState::GdbServerFailedToAttach;
             if stderr_buf.is_empty() {
                 self.last_error = format!("gdbserver exited early with status: {status}");
@@ -1165,7 +1199,29 @@ impl<'a> SessionCore<'a> {
             }
             return Ok(self.base_response().with_error(self.last_error.clone()));
         }
+        self.stop_reason = None;
+        // gdbserver runs a real inferior in the background whose stdout/stderr
+        // land in these pipes. Drain them continuously (to a sink), otherwise
+        // the kernel pipe buffer (~64KB) fills up and blocks the inferior.
+        let child_stdout = child.stdout.take();
+        let child_stderr = child.stderr.take();
         self.gdbserver_child = Some(child);
+        if let Some(stream) = child_stdout {
+            let handle = tokio::spawn(async move {
+                let mut reader = stream;
+                let mut sink = tokio::io::sink();
+                let _ = tokio::io::copy(&mut reader, &mut sink).await;
+            });
+            self.gdbserver_tasks.push(handle);
+        }
+        if let Some(stream) = child_stderr {
+            let handle = tokio::spawn(async move {
+                let mut reader = stream;
+                let mut sink = tokio::io::sink();
+                let _ = tokio::io::copy(&mut reader, &mut sink).await;
+            });
+            self.gdbserver_tasks.push(handle);
+        }
         self.debugger_state = DebuggerState::GdbServerAttached;
         self.last_error.clear();
         Ok(self.base_response())
@@ -1296,7 +1352,14 @@ impl<'a> SessionCore<'a> {
                     self.debugger_state = previous;
                     self.stop_reason = saved_reason;
                 } else if lower.contains("not being run") || lower.contains("no program") {
-                    self.debugger_state = DebuggerState::Attached;
+                    // Real gdb answers `info program` with "The program being
+                    // debugged is not being run." both *before* the inferior
+                    // starts and *after* it ended (killed / exited / crashed).
+                    // Keep terminal process states instead of collapsing them
+                    // back to Attached.
+                    if !Self::is_dead_or_exited_state(saved_state) {
+                        self.debugger_state = DebuggerState::Attached;
+                    }
                 } else if lower.contains("is executing") || lower.contains("is running") {
                     self.debugger_state = DebuggerState::Running;
                     self.stop_reason = None;
@@ -1364,6 +1427,14 @@ impl<'a> SessionCore<'a> {
             return Ok(self.base_response());
         }
 
+        if self.debugger_state != DebuggerState::Running {
+            // The inferior is already stopped (e.g. at a breakpoint) or gdb is
+            // idle. There is nothing to interrupt: return the current state
+            // without rewriting the stop attribution or fabricating a fresh
+            // "stopped at stepping" snapshot.
+            return Ok(self.base_response());
+        }
+
         let interrupt_result = self.backend.interrupt().await;
         if let Err(err) = interrupt_result {
             self.debugger_state = DebuggerState::Error;
@@ -1426,6 +1497,14 @@ impl<'a> SessionCore<'a> {
             || self.debugger_state == DebuggerState::GdbServerFailedToAttach
         {
             return Ok(self.base_response());
+        }
+        if self.debugger_state == DebuggerState::Running {
+            // `backtrace full` on a running inferior would block gdb until the
+            // program stops (or hits the exec timeout). Interrupt and resync
+            // first, mirroring full_backtrace_response's sibling tools.
+            let _ = self.backend.interrupt().await;
+            let _ = self.backend.exec("printf \"\"").await;
+            self.debugger_state = DebuggerState::StoppedAtStepping;
         }
         self.recover_error_state_without_restart();
         let mut response = self.base_response();
@@ -1656,7 +1735,7 @@ impl<'a> SessionCore<'a> {
             || lower.contains("architecture of file not recognized")
             || lower.contains("exec format error")
             || lower.contains("cannot execute binary file")
-            || lower.contains("error:")
+            || output_mentions_error(&lower)
         {
             self.debugger_state = DebuggerState::Error;
             return;
@@ -1836,6 +1915,12 @@ impl<'a> SessionCore<'a> {
     async fn stop_gdbserver_process(&mut self) -> Result<()> {
         if let Some(mut child) = self.gdbserver_child.take() {
             let _ = child.kill().await;
+            // Wait for the child so it gets reaped instead of lingering as a
+            // zombie once the drain tasks end on EOF.
+            let _ = child.wait().await;
+        }
+        for task in self.gdbserver_tasks.drain(..) {
+            task.abort();
         }
         Ok(())
     }
@@ -2156,6 +2241,45 @@ fn normalized_command_output(output: &str) -> Option<String> {
     }
 }
 
+/// True if a line is gdb value output (`$1 = ...` print results or
+/// `name = ...` assignments from `info locals`/`info args`) rather than an
+/// error message. Such values can legitimately contain the substring
+/// "error:" as program data and must not be mistaken for a gdb failure.
+fn looks_like_value_assignment(line: &str) -> bool {
+    let line = line
+        .trim_start()
+        .strip_prefix("(gdb) ")
+        .unwrap_or(line.trim_start());
+    let line = line.trim_start();
+    let after_name = if let Some(rest) = line.strip_prefix('$') {
+        rest.trim_start_matches(|c: char| c.is_ascii_digit())
+    } else {
+        let name_len = line
+            .bytes()
+            .take_while(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'.')
+            .count();
+        if name_len == 0 {
+            return false;
+        }
+        &line[name_len..]
+    };
+    after_name.trim_start().starts_with('=')
+}
+
+/// True if any output line mentions "error:" in a context that looks like a
+/// gdb error message, skipping value/assignment lines where the text is
+/// program data.
+fn output_mentions_error(output: &str) -> bool {
+    output.lines().any(|line| {
+        let line = line.trim_start();
+        let line = line.strip_prefix("(gdb) ").unwrap_or(line);
+        let line = line.trim_start();
+        !line.is_empty()
+            && !looks_like_value_assignment(line)
+            && line.to_ascii_lowercase().contains("error:")
+    })
+}
+
 fn looks_like_gdb_error(output: &str) -> bool {
     let lower = output.to_ascii_lowercase();
     lower.contains("undefined command")
@@ -2187,7 +2311,7 @@ fn looks_like_gdb_error(output: &str) -> bool {
         || lower.contains("architecture of file not recognized")
         || lower.contains("exec format error")
         || lower.contains("cannot execute binary file")
-        || lower.contains("error:")
+        || output_mentions_error(&lower)
         || lower.contains("cannot access memory")
 }
 

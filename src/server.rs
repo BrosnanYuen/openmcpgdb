@@ -1403,6 +1403,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_debugger_state_preserves_terminal_state_for_real_info_program_output() {
+        // Real gdb answers `info program` with "The program being debugged is
+        // not being run." *after* the inferior was killed too. The session must
+        // not collapse the terminal SigKill state back to Attached.
+        let handle = MockBackendHandle::with_default_response("ok");
+        handle.set_response("kill", "[Inferior 1 (process 123) killed]\n");
+        handle.set_response(
+            "info program",
+            "The program being debugged is not being run.\n",
+        );
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .gdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let kill_response = server.gdb_kill().await.0;
+        assert_eq!(kill_response.debugger_state, DebuggerState::SigKill);
+
+        let state_response = server.gdb_debugger_state().await.0;
+        assert_eq!(
+            state_response.debugger_state,
+            DebuggerState::SigKill,
+            "terminal sigkill state should survive a real info program 'not being run' response"
+        );
+    }
+
+    #[tokio::test]
     async fn test_run_does_not_auto_attach_when_not_attached() {
         let handle = MockBackendHandle::with_default_response("ok");
         let factory = Arc::new(MockGdbBackendFactory::new(handle.clone()));
@@ -1679,6 +1710,7 @@ mod tests {
     #[tokio::test]
     async fn test_gdb_interrupt_returns_stopped_with_full_snapshot() {
         let (server, handle) = test_server_with_mock();
+        handle.set_response("continue", "Continuing.\n");
 
         let _ = server
             .gdb_execute(Parameters(ExecuteArgs {
@@ -1692,12 +1724,14 @@ mod tests {
             }))
             .await;
 
+        // Interrupt only makes sense when the inferior is actually running.
+        let _ = server.gdb_continue().await;
         let response = server.gdb_interrupt().await.0;
 
         assert_eq!(
             response.debugger_state,
             DebuggerState::StoppedAtStepping,
-            "gdb_interrupt should move session into stopped-at-stepping"
+            "gdb_interrupt should move a running session into stopped-at-stepping"
         );
         assert!(
             response.variable_list.is_some(),
@@ -1721,6 +1755,29 @@ mod tests {
             commands.iter().any(|cmd| cmd == "backtrace full"),
             "gdb_interrupt should collect backtrace for normal snapshot response"
         );
+    }
+
+    #[tokio::test]
+    async fn test_interrupt_while_stopped_is_noop_and_preserves_breakpoint_stop() {
+        let handle = MockBackendHandle::with_default_response("ok");
+        handle.set_response("run", "Breakpoint 1, main () at src/main.c:10\n");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .gdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let _ = server.gdb_run().await;
+        let response = server.gdb_interrupt().await.0;
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::StoppedAtBreakpoint,
+            "interrupt should not rewrite the stop attribution of an already-stopped inferior"
+        );
+        assert_eq!(response.stop_reason, Some("breakpoint 1".to_string()));
     }
 
     #[tokio::test]
@@ -1950,6 +2007,43 @@ mod tests {
         assert_eq!(response.debugger_state, DebuggerState::Attached);
         assert!(response.error.to_ascii_lowercase().contains("no symbol"));
 
+        let state = server.gdb_debugger_state().await.0;
+        assert_eq!(state.debugger_state, DebuggerState::Attached);
+    }
+
+    #[tokio::test]
+    async fn test_print_value_containing_error_colon_is_not_treated_as_gdb_error() {
+        let handle = MockBackendHandle::with_default_response("ok");
+        handle.set_response("print \"no error: here\"", "$1 = \"no error: here\"\n");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle.clone()));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .gdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let response = server
+            .gdb_print(Parameters(PrintArgs {
+                expression: "\"no error: here\"".to_string(),
+            }))
+            .await
+            .0;
+
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::Attached,
+            "a benign value containing 'error:' must not flip the session to Error"
+        );
+        assert!(
+            response.error.is_empty(),
+            "error field should not be populated for a benign value: {:?}",
+            response.error
+        );
+
+        // The session must stay usable: a subsequent real gdb error is still
+        // detected, and a follow-up successful call recovers.
         let state = server.gdb_debugger_state().await.0;
         assert_eq!(state.debugger_state, DebuggerState::Attached);
     }
@@ -2359,6 +2453,46 @@ mod tests {
         assert!(
             commands.iter().any(|cmd| cmd == "printf \"\""),
             "running-state query should resync after interrupt"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_full_backtrace_while_running_interrupts_before_snapshot() {
+        let handle = MockBackendHandle::with_default_response("ok");
+        handle.set_response("backtrace full", "#0 main () at /tmp/main.c:10\n");
+        let factory = Arc::new(MockGdbBackendFactory::new(handle.clone()));
+        let server = OpenMcpGdbServer::new(test_config(), factory);
+
+        let _ = server
+            .gdb_execute(Parameters(ExecuteArgs {
+                executable_path: "/tmp/exe".to_string(),
+            }))
+            .await;
+
+        let _ = server.gdb_continue().await;
+
+        let response = server.gdb_full_backtrace().await.0;
+        assert_eq!(
+            response.debugger_state,
+            DebuggerState::StoppedAtStepping,
+            "full_backtrace on a running inferior should interrupt and report the stopped state"
+        );
+        assert!(
+            response
+                .backtrace
+                .as_ref()
+                .is_some_and(|bt| bt.contains_key("0")),
+            "full_backtrace should still return the collected frames"
+        );
+
+        let commands = handle.commands();
+        let bt_index = commands
+            .iter()
+            .position(|cmd| cmd == "backtrace full")
+            .expect("backtrace full should be sent");
+        assert!(
+            commands[..bt_index].iter().any(|cmd| cmd == "printf \"\""),
+            "full_backtrace should interrupt and resync before querying while running"
         );
     }
 
