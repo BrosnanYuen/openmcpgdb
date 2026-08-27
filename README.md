@@ -12,8 +12,8 @@ It is implemented with the `rmcp` crate and exposes a full `gdb_*` tool API for 
 - GDB process isolation per client.
 - Configurable display windows for source, backtrace, and watched variables.
 - Transport modes:
-  - `https://...` and `http://...` streamable HTTP mode (default)
-  - `stdio://...` for stdio MCP wiring when needed
+  - `stdio://` (default): MCP over stdin/stdout for direct client registration
+  - `http://...` and `https://...`: streamable HTTP mode for remote/shared use
 - Interactive MCP test client binary included.
 - Rust tests include:
   - in-process MCP server/client connectivity
@@ -27,11 +27,11 @@ It is implemented with the `rmcp` crate and exposes a full `gdb_*` tool API for 
 ```bash
 git clone https://github.com/BrosnanYuen/openmcpgdb.git
 cd openmcpgdb
-# Change the settings to point to your codebase and executable
-# Use HTTP for server compatibility 
+# Optional: create a config.json to override defaults (all fields are
+# optional; an empty {} config is valid)
 vim config.json
-# Run MCP server
-cargo run --bin  openmcpgdb  -- config.json 
+# Run MCP server (stdio transport by default, gdb resolved from PATH)
+cargo run --bin openmcpgdb
 ```
 
 2. Add to Claude Code `claude.json`
@@ -72,7 +72,7 @@ enabled = true
 ## Requirements
 
 - Rust toolchain (stable)
-- GDB at an absolute path (default `/usr/bin/gdb`)
+- GDB available on `PATH` (or set `gdb_path` to its absolute location)
 - Linux/macOS environment for the provided examples
 
 ## Project Layout
@@ -88,20 +88,27 @@ enabled = true
 
 ## Configuration
 
-The server loads JSON config from the first CLI argument, defaulting to `config.json` in project root.
+A JSON config file is loaded **only** when its path is passed as the first CLI argument. With no argument the server starts with built-in defaults — it never reads `./config.json` implicitly, so behavior is identical regardless of working directory (important for MCP client registration).
 
-All filesystem paths must be absolute.
+- Run `openmcpgdb --help` for usage.
+- Every field is optional; an empty `{}` config is valid.
+- Relative paths (`gdb_path` command names, `codebase_dir`, `executable_path`) are resolved at startup: bare commands via `PATH`, directories/files against the working directory. After resolution all paths become absolute.
 
-Example:
+> **Note on error reporting:** tools report failure through the structured
+> payload — `debugger_state: "error"` plus an `error` message — while the MCP
+> transport-level `isError` flag stays `false`. Clients should inspect
+> `debugger_state`, not only `isError`.
+
+Example (only overrides what differs from the defaults):
 
 ```json
 {
   "gdb_path": "/usr/bin/gdb",
   "gdb_options": "",
-  "codebase_dir": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot",
-  "executable_path": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot",
+  "codebase_dir": "/path/to/project",
+  "executable_path": "/path/to/project/target/debug/app",
   "mcp_server_name": "MCP GDB Server",
-  "mcp_server_url": "https://localhost:9443",
+  "mcp_server_url": "stdio://",
   "display_lines_before_current": 7,
   "display_lines_after_current": 8,
   "display_backtrace": 50,
@@ -110,15 +117,30 @@ Example:
 }
 ```
 
+Defaults:
+
+| Field | Default |
+| --- | --- |
+| `gdb_path` | `"gdb"` (resolved via `PATH`) |
+| `gdb_options` | `""` |
+| `codebase_dir` | current working directory |
+| `executable_path` | unset (`gdb_execute` receives the binary per call) |
+| `mcp_server_name` | `"MCP GDB Server"` |
+| `mcp_server_url` | `"stdio://"` |
+| `display_lines_before_current` | `7` |
+| `display_lines_after_current` | `8` |
+| `display_backtrace` | `6` |
+| `display_variable_list` | `9` |
+| `display_join_current_code` | `false` |
+
 `display_join_current_code` controls how `current_code` is returned:
 - `false`: object map keyed by line number
 - `true`: single joined string in the format `line | source` with newline separators
 
 ### `mcp_server_url`
 
-- Default: `https://localhost:9443`
+- Default: `stdio://` — MCP over stdin/stdout, the standard transport for registering the server with MCP clients.
 - `http://host:port/path` or `https://host:port/path`: run streamable HTTP on that bind address/path.
-- `stdio://...`: run MCP over stdio.
 
 Note: `https://` is parsed and accepted, but this project currently binds plain TCP HTTP directly. For real TLS, run behind a TLS-terminating reverse proxy.
 
@@ -130,12 +152,26 @@ cargo build
 
 ## Run the MCP Server
 
-### 1. Default HTTPS URL mode
+### 1. Default stdio mode
 
-Use default config:
+No config needed (or keep `mcp_server_url` at its `"stdio://"` default):
 
 ```bash
-cargo run --bin openmcpgdb -- config.json
+cargo run --bin openmcpgdb
+```
+
+Register the binary in your MCP client, e.g. for opencode:
+
+```json
+{
+  "mcp": {
+    "openmcpgdb": {
+      "type": "local",
+      "command": ["target/debug/openmcpgdb"],
+      "enabled": true
+    }
+  }
+}
 ```
 
 ### 2. HTTP/HTTPS custom URL mode
@@ -152,12 +188,12 @@ Run:
 cargo run --bin openmcpgdb -- config.json
 ```
 
-### 3. Optional stdio mode
+### 3. Optional stdio mode via config
 
 Set:
 
 ```json
-"mcp_server_url": "stdio://local"
+"mcp_server_url": "stdio://"
 ```
 
 Run:

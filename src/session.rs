@@ -2,47 +2,131 @@ use crate::{
     config::ServerConfig,
     error::{OpenMcpGdbError, Result},
     gdb::GdbBackend,
-    protocol::{CurrentCodePayload, DebuggerResponse, DebuggerState},
+    protocol::{BreakpointEntry, CurrentCodePayload, DebuggerResponse, DebuggerState},
 };
-use std::{collections::BTreeMap, path::PathBuf, process::Stdio, thread};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    process::Stdio,
+    thread,
+};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, sleep};
 
 #[derive(Debug)]
 pub enum ToolOperation {
-    Execute { executable_path: String },
+    Execute {
+        executable_path: String,
+    },
     Run,
-    GdbServer { ip: String, port: u16, pid: i64 },
-    TargetRemote { ip: String, port: u16 },
-    SetThread { id: i64 },
-    SetFrame { id: i64 },
-    AddBreakpoint { filename: String, linenumber: u64 },
-    ClearBreakpoint { filename: String, linenumber: u64 },
-    EnableBreakpoint { filename: String, linenumber: u64 },
-    DisableBreakpoint { filename: String, linenumber: u64 },
+    GdbServer {
+        ip: String,
+        port: u16,
+        pid: i64,
+    },
+    TargetRemote {
+        ip: String,
+        port: u16,
+    },
+    SetThread {
+        id: i64,
+    },
+    SetFrame {
+        id: i64,
+    },
+    /// location accepts any gdb breakpoint location: file:line, symbol,
+    /// function, file:function, symbol+offset, or *memory_address.
+    AddBreakpoint {
+        location: String,
+        condition: Option<String>,
+    },
+    /// target is a breakpoint number or any gdb location string.
+    ClearBreakpoint {
+        target: String,
+    },
+    EnableBreakpoint {
+        target: String,
+    },
+    DisableBreakpoint {
+        target: String,
+    },
     ListBreakpoint,
+    /// Attach to a running process by PID (bare gdb, symbols from /proc).
+    Attach {
+        pid: i64,
+    },
+    Detach,
     Next,
     Step,
     Continue,
+    Finish,
     Interrupt,
-    AddVariable { var: String },
-    DelVariable { var: String },
+    AddVariable {
+        var: String,
+    },
+    DelVariable {
+        var: String,
+    },
     DebuggerState,
     VariableList,
     CurrentCode,
     FullBacktrace,
     InfoThreads,
-    Print { var: String, value: Option<String> },
-    SetVar { var: String, value: String },
+    Print {
+        expression: String,
+    },
+    SetVar {
+        var: String,
+        value: String,
+    },
     InfoRegs,
     Quit,
     Kill,
     ResetBackToNotAttached,
-    SetDisplayLinesBeforeCurrent { size: usize },
-    SetDisplayLinesAfterCurrent { size: usize },
-    SetDisplayBacktrace { size: usize },
-    SetDisplayVariableList { size: usize },
-    Custom { cmd: String },
+    SetDisplay {
+        lines_before_current: Option<usize>,
+        lines_after_current: Option<usize>,
+        backtrace: Option<usize>,
+        variable_list: Option<usize>,
+    },
+    Watch {
+        expression: String,
+        mode: WatchMode,
+    },
+    ExamineMemory {
+        address: String,
+        count: u32,
+        format: char,
+        size: char,
+    },
+    NextInstruction,
+    StepInstruction,
+    /// Disassemble the current function, or around an address/symbol.
+    Disassemble {
+        address: Option<String>,
+    },
+    /// List arguments and locals of the selected frame.
+    FrameInfo,
+    Custom {
+        cmd: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchMode {
+    Write,
+    Read,
+    Access,
+}
+
+impl WatchMode {
+    fn command(&self) -> &'static str {
+        match self {
+            Self::Write => "watch",
+            Self::Read => "rwatch",
+            Self::Access => "awatch",
+        }
+    }
 }
 
 enum WorkerMessage {
@@ -115,6 +199,8 @@ struct SessionCore<'a> {
     config: ServerConfig,
     backend: &'a mut Box<dyn GdbBackend>,
     debugger_state: DebuggerState,
+    /// Cause of the most recent stop, e.g. "breakpoint 1" or "sigsegv".
+    stop_reason: Option<String>,
     watched_variables: Vec<String>,
     executable_path: Option<PathBuf>,
     gdbserver_child: Option<tokio::process::Child>,
@@ -179,6 +265,7 @@ impl<'a> SessionCore<'a> {
             config,
             backend,
             debugger_state: DebuggerState::NotAttached,
+            stop_reason: None,
             watched_variables: Vec::new(),
             executable_path: None,
             gdbserver_child: None,
@@ -199,10 +286,10 @@ impl<'a> SessionCore<'a> {
                 println!("[gdb_run] requested");
                 self.execute_run().await
             }
-            ToolOperation::GdbServer { ip, port, pid } => self.execute_gdbserver(ip, port, pid).await,
-            ToolOperation::TargetRemote { ip, port } => {
-                self.execute_target_remote(ip, port).await
+            ToolOperation::GdbServer { ip, port, pid } => {
+                self.execute_gdbserver(ip, port, pid).await
             }
+            ToolOperation::TargetRemote { ip, port } => self.execute_target_remote(ip, port).await,
             ToolOperation::SetThread { id } => {
                 self.execute_recoverable_command_with_output(&format!("thread {id}"), None)
                     .await
@@ -212,37 +299,34 @@ impl<'a> SessionCore<'a> {
                     .await
             }
             ToolOperation::AddBreakpoint {
-                filename,
-                linenumber,
+                location,
+                condition,
             } => {
-                self.execute_recoverable_command_with_output(
-                    &format!("break {filename}:{linenumber}"),
-                    None,
-                )
-                .await
-            }
-            ToolOperation::ClearBreakpoint {
-                filename,
-                linenumber,
-            } => {
-                self.execute_command(&format!("clear {filename}:{linenumber}"), None)
+                let mut command = format!("break {location}");
+                if let Some(condition) = condition
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|condition| !condition.is_empty())
+                {
+                    command.push_str(&format!(" if {condition}"));
+                }
+                self.execute_recoverable_command_with_output(&command, None)
                     .await
             }
-            ToolOperation::EnableBreakpoint {
-                filename,
-                linenumber,
-            } => {
-                self.execute_breakpoint_action_by_location(BreakpointAction::Enable, &filename, linenumber)
+            ToolOperation::ClearBreakpoint { target } => {
+                self.execute_breakpoint_delete(target).await
+            }
+            ToolOperation::EnableBreakpoint { target } => {
+                self.execute_breakpoint_toggle(BreakpointToggle::Enable, &target)
                     .await
             }
-            ToolOperation::DisableBreakpoint {
-                filename,
-                linenumber,
-            } => {
-                self.execute_breakpoint_action_by_location(BreakpointAction::Disable, &filename, linenumber)
+            ToolOperation::DisableBreakpoint { target } => {
+                self.execute_breakpoint_toggle(BreakpointToggle::Disable, &target)
                     .await
             }
             ToolOperation::ListBreakpoint => self.list_breakpoint_response().await,
+            ToolOperation::Attach { pid } => self.execute_attach_pid(pid).await,
+            ToolOperation::Detach => self.execute_detach().await,
             ToolOperation::Next => {
                 self.execute_with_full_snapshot("next", DebuggerState::StoppedAtStepping)
                     .await
@@ -255,6 +339,7 @@ impl<'a> SessionCore<'a> {
                 self.execute_with_full_snapshot("continue", DebuggerState::Running)
                     .await
             }
+            ToolOperation::Finish => self.execute_finish().await,
             ToolOperation::Interrupt => self.execute_interrupt().await,
             ToolOperation::AddVariable { var } => {
                 if !self
@@ -278,15 +363,7 @@ impl<'a> SessionCore<'a> {
                 self.execute_recoverable_command_with_output("info threads", None)
                     .await
             }
-            ToolOperation::Print { var, value } => {
-                if let Some(value) = value {
-                    self.execute_command(&format!("set variable {var} = {value}"), None)
-                        .await
-                } else {
-                    self.execute_print(&var)
-                        .await
-                }
-            }
+            ToolOperation::Print { expression } => self.execute_print(&expression).await,
             ToolOperation::SetVar { var, value } => {
                 self.execute_command(&format!("set variable {var} = {value}"), None)
                     .await
@@ -324,6 +401,7 @@ impl<'a> SessionCore<'a> {
                         self.executable_path = None;
                         self.watched_variables.clear();
                         self.last_error.clear();
+                        self.stop_reason = None;
                         Ok(self.base_response())
                     }
                     (quit_err, stop_err) => {
@@ -340,9 +418,7 @@ impl<'a> SessionCore<'a> {
                     }
                 }
             }
-            ToolOperation::Kill => {
-                self.execute_kill().await
-            }
+            ToolOperation::Kill => self.execute_kill().await,
             ToolOperation::ResetBackToNotAttached => {
                 let _ = self.stop_gdbserver_process().await;
                 let _ = self.backend.stop().await;
@@ -350,48 +426,47 @@ impl<'a> SessionCore<'a> {
                 self.executable_path = None;
                 self.watched_variables.clear();
                 self.last_error.clear();
+                self.stop_reason = None;
                 Ok(self.base_response())
             }
-            ToolOperation::SetDisplayLinesBeforeCurrent { size } => {
-                if size == 0 {
-                    self.last_error = "display_lines_before_current must be > 0".to_string();
-                    self.debugger_state = DebuggerState::Error;
-                    return Ok(self.base_response().with_error(self.last_error.clone()));
-                }
-                self.config.display_lines_before_current = size;
-                self.recover_error_state_without_restart();
-                Ok(self.base_response())
+            ToolOperation::SetDisplay {
+                lines_before_current,
+                lines_after_current,
+                backtrace,
+                variable_list,
+            } => {
+                self.execute_set_display(
+                    lines_before_current,
+                    lines_after_current,
+                    backtrace,
+                    variable_list,
+                )
+                .await
             }
-            ToolOperation::SetDisplayLinesAfterCurrent { size } => {
-                if size == 0 {
-                    self.last_error = "display_lines_after_current must be > 0".to_string();
-                    self.debugger_state = DebuggerState::Error;
-                    return Ok(self.base_response().with_error(self.last_error.clone()));
-                }
-                self.config.display_lines_after_current = size;
-                self.recover_error_state_without_restart();
-                Ok(self.base_response())
+            ToolOperation::Watch { expression, mode } => {
+                self.execute_watch(&expression, mode).await
             }
-            ToolOperation::SetDisplayBacktrace { size } => {
-                if size == 0 {
-                    self.last_error = "display_backtrace must be > 0".to_string();
-                    self.debugger_state = DebuggerState::Error;
-                    return Ok(self.base_response().with_error(self.last_error.clone()));
-                }
-                self.config.display_backtrace = size;
-                self.recover_error_state_without_restart();
-                Ok(self.base_response())
+            ToolOperation::ExamineMemory {
+                address,
+                count,
+                format,
+                size,
+            } => {
+                self.execute_examine_memory(&address, count, format, size)
+                    .await
             }
-            ToolOperation::SetDisplayVariableList { size } => {
-                if size == 0 {
-                    self.last_error = "display_variable_list must be > 0".to_string();
-                    self.debugger_state = DebuggerState::Error;
-                    return Ok(self.base_response().with_error(self.last_error.clone()));
-                }
-                self.config.display_variable_list = size;
-                self.recover_error_state_without_restart();
-                Ok(self.base_response())
+            ToolOperation::NextInstruction => {
+                self.execute_with_full_snapshot("nexti", DebuggerState::StoppedAtStepping)
+                    .await
             }
+            ToolOperation::StepInstruction => {
+                self.execute_with_full_snapshot("stepi", DebuggerState::StoppedAtStepping)
+                    .await
+            }
+            ToolOperation::Disassemble { address } => {
+                self.execute_disassemble(address.as_deref()).await
+            }
+            ToolOperation::FrameInfo => self.execute_frame_info().await,
             ToolOperation::Custom { cmd } => self.execute_command_with_output(&cmd, None).await,
         }
     }
@@ -448,10 +523,7 @@ impl<'a> SessionCore<'a> {
                 self.executable_path = Some(executable);
                 self.debugger_state = DebuggerState::Attached;
                 self.last_error.clear();
-                println!(
-                    "[gdb_execute] success: gdb started for {}",
-                    executable_path
-                );
+                println!("[gdb_execute] success: gdb started for {}", executable_path);
                 Ok(self.base_response())
             }
             Err(err) => {
@@ -585,7 +657,9 @@ impl<'a> SessionCore<'a> {
     }
 
     async fn execute_info_regs(&mut self) -> Result<DebuggerResponse> {
-        let response = self.execute_command_with_output("info all-registers", None).await?;
+        let response = self
+            .execute_command_with_output("info all-registers", None)
+            .await?;
         let output = response
             .command_output
             .as_deref()
@@ -604,11 +678,10 @@ impl<'a> SessionCore<'a> {
         Ok(response)
     }
 
-    async fn execute_breakpoint_action_by_location(
+    async fn execute_breakpoint_toggle(
         &mut self,
-        action: BreakpointAction,
-        filename: &str,
-        linenumber: u64,
+        action: BreakpointToggle,
+        target: &str,
     ) -> Result<DebuggerResponse> {
         if self.executable_path.is_none() {
             return Ok(self.base_response());
@@ -620,13 +693,22 @@ impl<'a> SessionCore<'a> {
             self.debugger_state = DebuggerState::StoppedAtStepping;
         }
 
-        let ids = self
-            .resolve_breakpoint_ids_by_location(filename, linenumber)
-            .await?;
+        let ids = if let Some(id) = parse_breakpoint_number(target) {
+            vec![id.to_string()]
+        } else {
+            match self.resolve_breakpoint_ids_by_location(target).await {
+                Ok(ids) => ids,
+                Err(err) => {
+                    self.debugger_state = DebuggerState::Error;
+                    self.last_error = err.to_string();
+                    return Ok(self.base_response().with_error(self.last_error.clone()));
+                }
+            }
+        };
 
         if ids.is_empty() {
             self.debugger_state = DebuggerState::Error;
-            self.last_error = format!("No breakpoint at {filename}:{linenumber}.");
+            self.last_error = format!("no breakpoint matching {target:?} found");
             return Ok(self.base_response().with_error(self.last_error.clone()));
         }
 
@@ -645,40 +727,273 @@ impl<'a> SessionCore<'a> {
         Ok(self.base_response())
     }
 
-    async fn resolve_breakpoint_ids_by_location(
-        &mut self,
-        filename: &str,
-        linenumber: u64,
-    ) -> Result<Vec<String>> {
-        let target = std::path::Path::new(filename);
+    /// Delete a breakpoint by gdb's breakpoint number or by any location form.
+    async fn execute_breakpoint_delete(&mut self, target: String) -> Result<DebuggerResponse> {
+        if self.executable_path.is_none() {
+            return Ok(self.base_response());
+        }
+
+        // Numbers go straight to `delete N`; locations resolve to numbers first
+        // so watchpoints and symbol locations delete reliably.
+        if let Some(id) = parse_breakpoint_number(&target) {
+            return self
+                .execute_command_with_output(&format!("delete {id}"), None)
+                .await;
+        }
+
+        if self.debugger_state == DebuggerState::Running {
+            let _ = self.backend.interrupt().await;
+            let _ = self.backend.exec("printf \"\"").await;
+            self.debugger_state = DebuggerState::StoppedAtStepping;
+        }
+
+        let ids = match self.resolve_breakpoint_ids_by_location(&target).await {
+            Ok(ids) => ids,
+            Err(err) => {
+                self.debugger_state = DebuggerState::Error;
+                self.last_error = err.to_string();
+                return Ok(self.base_response().with_error(self.last_error.clone()));
+            }
+        };
+
+        if ids.is_empty() {
+            self.debugger_state = DebuggerState::Error;
+            self.last_error = format!("no breakpoint matching {target:?} found");
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
+
+        let command = format!("delete {}", ids.join(" "));
+        self.execute_command_with_output(&command, None).await
+    }
+
+    /// Resolve a location string against the current breakpoint listing,
+    /// returning the owning breakpoint numbers.
+    async fn resolve_breakpoint_ids_by_location(&mut self, location: &str) -> Result<Vec<String>> {
         let output = self.backend.exec("info breakpoints").await?;
-        let mut ids = Vec::new();
+        Ok(resolve_breakpoint_ids_from_listing(&output, location))
+    }
 
-        for line in output.lines() {
-            if let Some((id, path, line_no)) = parse_breakpoint_location_line(line) {
-                if line_no != linenumber {
-                    continue;
-                }
-                let normalized = {
-                    let parsed_path = std::path::Path::new(&path);
-                    if parsed_path.is_absolute() {
-                        parsed_path.to_path_buf()
-                    } else {
-                        self.config.codebase_dir.join(parsed_path)
-                    }
-                };
+    async fn execute_set_display(
+        &mut self,
+        lines_before_current: Option<usize>,
+        lines_after_current: Option<usize>,
+        backtrace: Option<usize>,
+        variable_list: Option<usize>,
+    ) -> Result<DebuggerResponse> {
+        let updates = [
+            ("display_lines_before_current", lines_before_current),
+            ("display_lines_after_current", lines_after_current),
+            ("display_backtrace", backtrace),
+            ("display_variable_list", variable_list),
+        ];
+        for (name, value) in updates {
+            if value == Some(0) {
+                self.last_error = format!("{name} must be > 0");
+                self.debugger_state = DebuggerState::Error;
+                return Ok(self.base_response().with_error(self.last_error.clone()));
+            }
+        }
+        if let Some(size) = lines_before_current {
+            self.config.display_lines_before_current = size;
+        }
+        if let Some(size) = lines_after_current {
+            self.config.display_lines_after_current = size;
+        }
+        if let Some(size) = backtrace {
+            self.config.display_backtrace = size;
+        }
+        if let Some(size) = variable_list {
+            self.config.display_variable_list = size;
+        }
+        self.recover_error_state_without_restart();
+        Ok(self.base_response())
+    }
 
-                if normalized == target
-                    || normalized
-                        .to_string_lossy()
-                        .ends_with(target.to_string_lossy().as_ref())
-                {
-                    ids.push(id);
-                }
+    /// Set a watchpoint on an expression: write (default), read, or access.
+    async fn execute_watch(
+        &mut self,
+        expression: &str,
+        mode: WatchMode,
+    ) -> Result<DebuggerResponse> {
+        let command = format!("{} {}", mode.command(), expression);
+        self.execute_recoverable_command_with_output(&command, None)
+            .await
+    }
+
+    /// Examine memory at an address using gdb's x command with explicit
+    /// count/format/size controls; returns parsed rows in `memory`.
+    async fn execute_examine_memory(
+        &mut self,
+        address: &str,
+        count: u32,
+        format: char,
+        size: char,
+    ) -> Result<DebuggerResponse> {
+        const VALID_FORMATS: [char; 8] = ['x', 'd', 'u', 'o', 't', 'c', 's', 'i'];
+        const VALID_SIZES: [char; 4] = ['b', 'h', 'w', 'g'];
+        if !VALID_FORMATS.contains(&format) {
+            self.debugger_state = DebuggerState::Error;
+            self.last_error = format!(
+                "invalid examine format {format:?}; expected one of {}",
+                VALID_FORMATS.iter().collect::<String>()
+            );
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
+        if !VALID_SIZES.contains(&size) {
+            self.debugger_state = DebuggerState::Error;
+            self.last_error = format!(
+                "invalid examine size {size:?}; expected one of {}",
+                VALID_SIZES.iter().collect::<String>()
+            );
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
+        if count == 0 {
+            self.debugger_state = DebuggerState::Error;
+            self.last_error = "examine count must be > 0".to_string();
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
+
+        let command = format!("x/{count}{format}{size} {address}");
+        let response = self
+            .execute_recoverable_command_with_output(&command, None)
+            .await?;
+
+        if response.debugger_state == DebuggerState::Error {
+            return Ok(response);
+        }
+
+        // Surface parsed address->values rows alongside the raw output.
+        if let Some(output) = &response.command_output {
+            let memory = parse_examine_memory_rows(output);
+            if !memory.is_empty() {
+                let mut enriched = response;
+                enriched.memory = Some(memory);
+                return Ok(enriched);
+            }
+        }
+        Ok(response)
+    }
+
+    /// Run until the current function returns.
+    async fn execute_finish(&mut self) -> Result<DebuggerResponse> {
+        if self.executable_path.is_none() {
+            return Ok(self.base_response());
+        }
+        self.execute_with_full_snapshot("finish", DebuggerState::StoppedAtStepping)
+            .await
+    }
+
+    /// Attach to a running process by PID. Starts a bare gdb (no symbol
+    /// file required; gdb reads the live binary from /proc).
+    async fn execute_attach_pid(&mut self, pid: i64) -> Result<DebuggerResponse> {
+        if pid <= 0 {
+            self.debugger_state = DebuggerState::FailedToAttach;
+            self.last_error = "pid must be > 0".to_string();
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
+
+        match self.backend.start(Path::new("")).await {
+            Ok(_) => {}
+            Err(err) => {
+                self.debugger_state = DebuggerState::FailedToAttach;
+                self.last_error = err.to_string();
+                return Ok(self.base_response().with_error(self.last_error.clone()));
             }
         }
 
-        Ok(ids)
+        let attach_output = match self.backend.exec(&format!("attach {pid}")).await {
+            Ok(output) => output,
+            Err(err) => {
+                self.debugger_state = DebuggerState::Error;
+                self.last_error = err.to_string();
+                return Ok(self.base_response().with_error(self.last_error.clone()));
+            }
+        };
+
+        self.update_state_from_output(&attach_output, Some(DebuggerState::Attached));
+        if matches!(
+            self.debugger_state,
+            DebuggerState::Error | DebuggerState::FailedToAttach
+        ) {
+            self.last_error = normalized_command_output(&attach_output)
+                .unwrap_or_else(|| format!("failed to attach to pid {pid}"));
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
+
+        // Record a truthful absolute path so "attached" invariants hold.
+        self.executable_path = Some(PathBuf::from(format!("/proc/{pid}/exe")));
+        self.debugger_state = DebuggerState::Attached;
+        self.last_error.clear();
+        self.stop_reason = None;
+        let mut enriched = self.base_response();
+        enriched.command_output = normalized_command_output(&attach_output);
+        Ok(enriched)
+    }
+
+    /// Detach from the current process, leaving it running.
+    async fn execute_detach(&mut self) -> Result<DebuggerResponse> {
+        if self.executable_path.is_none() {
+            return Ok(self.base_response());
+        }
+
+        if self.debugger_state == DebuggerState::Running {
+            let _ = self.backend.interrupt().await;
+            let _ = self.backend.exec("printf \"\"").await;
+            self.debugger_state = DebuggerState::StoppedAtStepping;
+        }
+
+        let response = self.execute_command_with_output("detach", None).await?;
+        if !matches!(
+            response.debugger_state,
+            DebuggerState::NotAttached | DebuggerState::Error
+        ) {
+            // gdb reports "Detaching from program ..." -> NotAttached via state mapping.
+            self.debugger_state = DebuggerState::NotAttached;
+        }
+        if self.debugger_state == DebuggerState::NotAttached {
+            self.executable_path = None;
+            self.watched_variables.clear();
+            self.last_error.clear();
+            self.stop_reason = None;
+        }
+        let mut final_response = self.base_response();
+        final_response.command_output = response.command_output;
+        Ok(final_response)
+    }
+
+    /// Disassemble the current function or around an address/symbol.
+    async fn execute_disassemble(&mut self, address: Option<&str>) -> Result<DebuggerResponse> {
+        let command = match address.map(str::trim).filter(|a| !a.is_empty()) {
+            Some(address) => format!("disassemble {address}"),
+            None => "disassemble".to_string(),
+        };
+        self.execute_recoverable_command_with_output(&command, None)
+            .await
+    }
+
+    /// List arguments and locals of the selected frame as labeled text.
+    async fn execute_frame_info(&mut self) -> Result<DebuggerResponse> {
+        let args = self.execute_command_with_output("info args", None).await?;
+        let locals = self
+            .execute_command_with_output("info locals", None)
+            .await?;
+
+        let mut combined = String::new();
+        combined.push_str("--- args ---\n");
+        combined.push_str(args.command_output.as_deref().unwrap_or_default().trim());
+        combined.push_str("\n--- locals ---\n");
+        combined.push_str(locals.command_output.as_deref().unwrap_or_default().trim());
+
+        let mut response = self.base_response();
+        if !args.error.is_empty() && !locals.error.is_empty() {
+            response.error = format!("{}; {}", args.error, locals.error);
+        } else if !args.error.is_empty() {
+            response.error = args.error;
+        } else if !locals.error.is_empty() {
+            response.error = locals.error;
+        }
+        response.command_output = Some(combined);
+        Ok(response)
     }
 
     async fn execute_run(&mut self) -> Result<DebuggerResponse> {
@@ -748,6 +1063,15 @@ impl<'a> SessionCore<'a> {
         // Remote attach still requires a local gdb process. If it is not started yet,
         // start gdb with configured executable for symbols before target remote.
         if self.executable_path.is_none() {
+            if self.config.executable_path.as_os_str().is_empty() {
+                // executable_path is optional in the config; without a default
+                // binary we cannot start gdb for symbols here.
+                self.debugger_state = DebuggerState::FailedToAttach;
+                self.last_error = "no executable attached: run gdb_execute first, or set \
+                                   executable_path in the config"
+                    .to_string();
+                return Ok(self.base_response().with_error(self.last_error.clone()));
+            }
             match self.backend.start(&self.config.executable_path).await {
                 Ok(_) => {
                     self.executable_path = Some(self.config.executable_path.clone());
@@ -827,6 +1151,7 @@ impl<'a> SessionCore<'a> {
         }
 
         self.debugger_state = DebuggerState::StoppedAtStepping;
+        self.stop_reason = Some("interrupt".to_string());
         self.last_error.clear();
         self.full_snapshot_response().await
     }
@@ -898,15 +1223,13 @@ impl<'a> SessionCore<'a> {
         let output = self.backend.exec("info breakpoints").await;
         match output {
             Ok(output) => {
-                let lines: Vec<String> = output
-                    .lines()
-                    .map(str::trim_end)
-                    .filter(|line| !line.is_empty())
-                    .map(|line| line.strip_prefix("(gdb) ").unwrap_or(line).to_string())
+                let entries: Vec<BreakpointEntry> = parse_breakpoint_entries(&output)
+                    .into_iter()
+                    .map(|(number, text)| parse_breakpoint_entry(&number, &text))
                     .collect();
 
                 let mut response = self.base_response();
-                response.breakpoints = Some(lines);
+                response.breakpoints = Some(entries);
                 Ok(response)
             }
             Err(err) => {
@@ -1013,11 +1336,7 @@ impl<'a> SessionCore<'a> {
 
     async fn collect_current_code(
         &mut self,
-    ) -> Result<(
-        Option<String>,
-        Option<u64>,
-        Option<BTreeMap<u64, String>>,
-    )> {
+    ) -> Result<(Option<String>, Option<u64>, Option<BTreeMap<u64, String>>)> {
         let frame = self.backend.exec("frame").await?;
         let (path, line) = parse_path_and_line(&frame);
 
@@ -1027,10 +1346,7 @@ impl<'a> SessionCore<'a> {
             let after = self.config.display_lines_after_current as u64;
             let start = std::cmp::max(1, line.saturating_sub(before));
             let end = line + after;
-            let list_output = self
-                .backend
-                .exec(&format!("list {start},{end}"))
-                .await?;
+            let list_output = self.backend.exec(&format!("list {start},{end}")).await?;
             for raw_line in list_output.lines() {
                 if let Some((number, source)) = parse_gdb_list_line(raw_line) {
                     code_lines.insert(number, source.to_string());
@@ -1062,6 +1378,7 @@ impl<'a> SessionCore<'a> {
 
     fn base_response(&self) -> DebuggerResponse {
         let mut response = DebuggerResponse::new(self.debugger_state);
+        response.stop_reason = self.stop_reason.clone();
         if !self.last_error.is_empty() {
             response.error = self.last_error.clone();
         }
@@ -1070,6 +1387,8 @@ impl<'a> SessionCore<'a> {
 
     fn update_state_from_output(&mut self, output: &str, fallback_state: Option<DebuggerState>) {
         let lower = output.to_ascii_lowercase();
+        // A fresh command resets the previous stop cause unless a new one appears below.
+        self.stop_reason = None;
 
         // GDB command failures should be surfaced as Error state.
         if lower.contains("undefined command")
@@ -1083,6 +1402,9 @@ impl<'a> SessionCore<'a> {
             || lower.contains("no source file named")
             || lower.contains("no breakpoint at")
             || lower.contains("no breakpoint number")
+            || lower.contains("not meaningful in the outermost frame")
+            || lower.contains("can't attach")
+            || lower.contains("unable to attach")
             || lower.contains("error:")
         {
             self.debugger_state = DebuggerState::Error;
@@ -1092,6 +1414,7 @@ impl<'a> SessionCore<'a> {
         // Signal detection: check both explicit signal names and descriptive messages.
         if lower.contains("sigsegv") || lower.contains("segmentation fault") {
             self.debugger_state = DebuggerState::SigSegv;
+            self.stop_reason = Some("sigsegv".to_string());
             return;
         }
         if lower.contains("sigabrt")
@@ -1099,34 +1422,42 @@ impl<'a> SessionCore<'a> {
             || lower.contains("program received signal sigabrt")
         {
             self.debugger_state = DebuggerState::SigAbrt;
+            self.stop_reason = Some("sigabrt".to_string());
             return;
         }
         if lower.contains("sigbus") || lower.contains("bus error") {
             self.debugger_state = DebuggerState::SigBus;
+            self.stop_reason = Some("sigbus".to_string());
             return;
         }
         if lower.contains("sigfpe") || lower.contains("floating point exception") {
             self.debugger_state = DebuggerState::SigFpe;
+            self.stop_reason = Some("sigfpe".to_string());
             return;
         }
         if lower.contains("sigill") || lower.contains("illegal instruction") {
             self.debugger_state = DebuggerState::SigIll;
+            self.stop_reason = Some("sigill".to_string());
             return;
         }
         if lower.contains("sigtrap") {
             self.debugger_state = DebuggerState::SigTrap;
+            self.stop_reason = Some("sigtrap".to_string());
             return;
         }
         if lower.contains("sigterm") {
             self.debugger_state = DebuggerState::SigTerm;
+            self.stop_reason = Some("sigterm".to_string());
             return;
         }
         if lower.contains("sigkill") {
             self.debugger_state = DebuggerState::SigKill;
+            self.stop_reason = Some("sigkill".to_string());
             return;
         }
         if lower.contains("sigint") && !lower.contains("breakpoint") {
             self.debugger_state = DebuggerState::StoppedAtStepping;
+            self.stop_reason = Some("interrupt".to_string());
             return;
         }
 
@@ -1140,16 +1471,27 @@ impl<'a> SessionCore<'a> {
             return;
         }
 
-        // Breakpoint, watchpoint, and catchpoint stop detection.
-        if contains_breakpoint_stop(output) {
+        // Breakpoint hit detection: "Breakpoint 1, ..." lines carry the id.
+        if let Some(id) = parse_breakpoint_stop_id(output) {
             self.debugger_state = DebuggerState::StoppedAtBreakpoint;
+            self.stop_reason = Some(format!("breakpoint {id}"));
             return;
         }
         if contains_breakpoint_creation(output) {
             return;
         }
-        if lower.contains("watchpoint") || lower.contains("hardware watchpoint") {
+
+        // Watchpoint hits report old/new values; creation only echoes the expression.
+        if contains_watchpoint_trigger(output) {
             self.debugger_state = DebuggerState::StoppedAtBreakpoint;
+            self.stop_reason = Some(
+                parse_watchpoint_stop_id(output)
+                    .map(|id| format!("watchpoint {id}"))
+                    .unwrap_or_else(|| "watchpoint".to_string()),
+            );
+            return;
+        }
+        if contains_watchpoint_creation(output) {
             return;
         }
         if lower.contains("catchpoint") {
@@ -1158,14 +1500,13 @@ impl<'a> SessionCore<'a> {
         }
 
         // Program termination and exit detection.
-
-        // Program termination and exit detection.
         if lower.contains("exited normally")
             || lower.contains("exited with code")
             || lower.contains("exited abnormally")
             || (lower.contains("inferior") && lower.contains("exited"))
         {
             self.debugger_state = DebuggerState::Exited;
+            self.stop_reason = Some("exited".to_string());
             return;
         }
 
@@ -1191,6 +1532,7 @@ impl<'a> SessionCore<'a> {
         // User interrupt detection.
         if lower.contains("interrupted") {
             self.debugger_state = DebuggerState::StoppedAtBreakpoint;
+            self.stop_reason = Some("interrupt".to_string());
             return;
         }
 
@@ -1211,11 +1553,15 @@ impl<'a> SessionCore<'a> {
             || lower.contains("terminated with signal sigkill")
         {
             self.debugger_state = DebuggerState::SigKill;
+            self.stop_reason = Some("sigkill".to_string());
             return;
         }
 
         if let Some(state) = fallback_state {
             self.debugger_state = state;
+            if state == DebuggerState::StoppedAtStepping {
+                self.stop_reason = Some("step".to_string());
+            }
         }
     }
 
@@ -1258,7 +1604,10 @@ impl<'a> SessionCore<'a> {
         match output {
             Ok(output) => {
                 let mut merged_output = output.clone();
-                if output.to_ascii_lowercase().contains("kill the program being debugged") {
+                if output
+                    .to_ascii_lowercase()
+                    .contains("kill the program being debugged")
+                {
                     let confirm = self.backend.exec("y").await;
                     match confirm {
                         Ok(confirm_output) => {
@@ -1272,18 +1621,12 @@ impl<'a> SessionCore<'a> {
                         }
                     }
                 }
-
                 self.update_state_from_output(&merged_output, None);
-                let lower = merged_output.to_ascii_lowercase();
-                if lower.contains("the program is not being run") || lower.contains("no inferior") {
-                    self.debugger_state = DebuggerState::NotAttached;
-                } else if lower.contains("killed")
-                    || lower.contains("sigkill")
-                    || lower.contains("terminated with signal")
-                {
-                    self.debugger_state = DebuggerState::SigKill;
+                if self.debugger_state == DebuggerState::Error {
+                    self.last_error = normalized_command_output(&output)
+                        .unwrap_or_else(|| "gdb kill failed".to_string());
+                    return Ok(self.base_response().with_error(self.last_error.clone()));
                 }
-                self.last_error.clear();
                 Ok(self.base_response())
             }
             Err(err) => {
@@ -1296,18 +1639,227 @@ impl<'a> SessionCore<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum BreakpointAction {
+enum BreakpointToggle {
     Enable,
     Disable,
 }
 
-impl BreakpointAction {
+impl BreakpointToggle {
     fn command_for_id(&self, id: &str) -> String {
         match self {
             Self::Enable => format!("enable {id}"),
             Self::Disable => format!("disable {id}"),
         }
     }
+}
+
+/// Parse a pure breakpoint number ("2", "2.1" sub-id allowed). Returns None
+/// for location-style targets so callers can fall back to listing resolution.
+fn parse_breakpoint_number(target: &str) -> Option<String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let valid = trimmed.chars().all(|c| c.is_ascii_digit() || c == '.');
+    if valid && trimmed.chars().any(|c| c.is_ascii_digit()) {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
+
+fn resolve_breakpoint_ids_from_listing(listing: &str, location: &str) -> Vec<String> {
+    let location = location.trim();
+    let lower_location = location.to_ascii_lowercase();
+    let mut ids = Vec::new();
+
+    for (id, entry) in parse_breakpoint_entries(listing) {
+        let lower_entry = entry.to_ascii_lowercase();
+
+        // *address targets: compare hex addresses numerically so zero-padded
+        // listing entries ("0x00000000004005a0") match "*0x4005a0".
+        if let Some(address) = location.strip_prefix('*') {
+            let target_value = u64::from_str_radix(address.trim_start_matches("0x"), 16).ok();
+            let matches = entry_words(&entry).any(|word| {
+                let hex = word.trim_start_matches("0x").trim_start_matches('*');
+                match (u64::from_str_radix(hex, 16), target_value) {
+                    (Ok(word_value), Some(target)) => word_value == target,
+                    _ => false,
+                }
+            }) || target_value
+                .map(|target| lower_entry.contains(&format!("{target:#x}")))
+                .unwrap_or(false)
+                || contains_word_boundaries(&lower_entry, &lower_location);
+            if matches {
+                ids.push(id);
+            }
+            continue;
+        }
+
+        if contains_word_boundaries(&lower_entry, &lower_location) {
+            ids.push(id);
+            continue;
+        }
+
+        // file:line targets may appear with an absolute path in the listing.
+        if location.contains(':')
+            && let Some((file_part, line_no)) = location.rsplit_once(':')
+            && line_no.parse::<u64>().is_ok()
+        {
+            let file_name = std::path::Path::new(file_part)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if !file_name.is_empty()
+                && contains_word_boundaries(&lower_entry, &file_name.to_ascii_lowercase())
+                && contains_line_number(&lower_entry, line_no)
+            {
+                ids.push(id);
+            }
+        }
+    }
+
+    ids
+}
+
+/// Substring match that requires word boundaries on both sides, so target
+/// "app" does not match "dbg_app.c" and "main" does not match "domain".
+fn contains_word_boundaries(haystack_lower: &str, needle_lower: &str) -> bool {
+    let mut from = 0;
+    while let Some(pos) = haystack_lower[from..].find(needle_lower) {
+        let start = from + pos;
+        let end = start + needle_lower.len();
+        let before_ok = haystack_lower[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        let after_ok = haystack_lower[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// True if the entry references ":<line_no>" without being part of a longer
+/// number (":5" must not match ":55").
+fn contains_line_number(entry_lower: &str, line_no: &str) -> bool {
+    let pattern = format!(":{line_no}");
+    let mut from = 0;
+    while let Some(pos) = entry_lower[from..].find(&pattern) {
+        let start = from + pos;
+        let end = start + pattern.len();
+        let after_digit = entry_lower[end..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_digit());
+        if !after_digit {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// Convert one folded listing entry into a structured breakpoint record.
+fn parse_breakpoint_entry(number: &str, text: &str) -> BreakpointEntry {
+    // Layout: "<kind> keep|del <y|n> <address/what...>".
+    for disp in [" keep ", " del "] {
+        if let Some((kind, tail)) = text.split_once(disp) {
+            let mut chars = tail.chars();
+            let enabled = matches!(chars.next(), Some('y'));
+            let detail = tail[1..].trim_start().to_string();
+            return BreakpointEntry {
+                number: number.to_string(),
+                kind: kind.trim().to_string(),
+                enabled,
+                detail,
+            };
+        }
+    }
+    // Unknown layout: keep the raw remainder so nothing is lost.
+    BreakpointEntry {
+        number: number.to_string(),
+        kind: text
+            .split_whitespace()
+            .next()
+            .unwrap_or("unknown")
+            .to_string(),
+        enabled: false,
+        detail: text.to_string(),
+    }
+}
+
+/// Group `info breakpoints` output into (breakpoint-number, full-entry-text)
+/// pairs, folding wrapped continuation lines into their owning entry.
+fn parse_breakpoint_entries(listing: &str) -> Vec<(String, String)> {
+    let mut entries: Vec<(String, String)> = Vec::new();
+    for line in listing.lines() {
+        match split_breakpoint_listing_line(line) {
+            Some((id, rest)) => entries.push((id, rest.to_string())),
+            None => {
+                if let Some((_, text)) = entries.last_mut() {
+                    text.push(' ');
+                    text.push_str(line.trim());
+                }
+            }
+        }
+    }
+    entries
+}
+
+/// Split an `info breakpoints` data row into (breakpoint-number, rest-of-line).
+/// Returns None for headers, blanks, and non-breakpoint rows.
+fn split_breakpoint_listing_line(line: &str) -> Option<(String, &str)> {
+    let trimmed = line.trim_start();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let id = parts.next()?;
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    let rest = parts.next()?.trim_start();
+    Some((id.to_string(), rest))
+}
+
+/// Yield the words of an entry line with common gdb decorations stripped.
+fn entry_words(entry: &str) -> impl Iterator<Item = &str> {
+    entry
+        .split(|c: char| c.is_whitespace() || c == ',' || c == ':')
+        .map(str::trim)
+        .filter(|word| !word.is_empty())
+}
+
+/// Parse gdb examine-memory output rows into address -> values map.
+/// Recognizes lines shaped like "0x7f...a3f0:\t0x00000001 0x00000002 ...".
+fn parse_examine_memory_rows(output: &str) -> BTreeMap<String, String> {
+    let mut rows = BTreeMap::new();
+    for line in output.lines() {
+        let trimmed = line.trim_start().trim_start_matches("(gdb) ").trim_start();
+        if !trimmed.starts_with("0x") {
+            continue;
+        }
+        let Some(colon_idx) = trimmed.find(':') else {
+            continue;
+        };
+        // gdb may annotate addresses with a symbol: "0x404050 <counter>:".
+        let mut address = &trimmed[..colon_idx];
+        if let Some(symbol_idx) = address.find(" <") {
+            address = &address[..symbol_idx];
+        }
+        if !address[2..].chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let values = trimmed[(colon_idx + 1)..].trim();
+        if values.is_empty() {
+            continue;
+        }
+        rows.insert(address.to_string(), values.to_string());
+    }
+    rows
 }
 
 fn normalize_gdb_value(output: &str) -> String {
@@ -1318,7 +1870,7 @@ fn normalize_gdb_value(output: &str) -> String {
     if let Some((_, rhs)) = trimmed.split_once('=') {
         return rhs.trim().to_string();
     }
-    return trimmed.to_string();
+    trimmed.to_string()
 }
 
 fn normalized_command_output(output: &str) -> Option<String> {
@@ -1344,6 +1896,9 @@ fn looks_like_gdb_error(output: &str) -> bool {
         || lower.contains("no source file named")
         || lower.contains("no breakpoint at")
         || lower.contains("no breakpoint number")
+        || lower.contains("not meaningful in the outermost frame")
+        || lower.contains("can't attach")
+        || lower.contains("unable to attach")
         || lower.contains("error:")
         || lower.contains("cannot access memory")
 }
@@ -1357,38 +1912,87 @@ fn is_recoverable_command_error(lower_error: &str) -> bool {
         || lower_error.contains("no breakpoint number")
         || lower_error.contains("a syntax error in expression")
         || lower_error.contains("cannot find bounds of current function")
-}
-
-fn contains_breakpoint_stop(output: &str) -> bool {
-    output.lines().any(|line| {
-        let trimmed = line.trim_start().to_ascii_lowercase();
-        if let Some(rest) = trimmed.strip_prefix("breakpoint ") {
-            return rest.contains(',');
-        }
-        false
-    })
+        || lower_error.contains("not meaningful in the outermost frame")
+        || lower_error.contains("can't attach")
+        || lower_error.contains("unable to attach")
 }
 
 fn contains_breakpoint_creation(output: &str) -> bool {
     output.lines().any(|line| {
         let trimmed = line.trim_start().to_ascii_lowercase();
         if let Some(rest) = trimmed.strip_prefix("breakpoint ") {
-            return rest.contains(" at 0x")
-                || rest.contains(": file ")
-                || rest.contains("pending");
+            return rest.contains(" at 0x") || rest.contains(": file ") || rest.contains("pending");
         }
         false
     })
+}
+
+/// Extract the breakpoint id from a stop line like "Breakpoint 1, main () at ...".
+/// Creation lines ("Breakpoint 1 at 0x1234") have no comma and are not stops.
+fn parse_breakpoint_stop_id(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        let rest = match trimmed
+            .strip_prefix("Breakpoint ")
+            .or_else(|| trimmed.strip_prefix("breakpoint "))
+        {
+            Some(rest) => rest,
+            None => continue,
+        };
+        let id: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !id.is_empty() && rest[id.len()..].starts_with(',') {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// A watchpoint hit reports old/new values; a creation echo does not.
+fn contains_watchpoint_trigger(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    lower.contains("watchpoint")
+        && (lower.contains("old value") || lower.contains("new value") || lower.contains("value ="))
+}
+
+/// Watchpoint creation echoes like "Hardware watchpoint 2: x" or
+/// "Hardware access (read/write) watchpoint 3: y" without value lines.
+fn contains_watchpoint_creation(output: &str) -> bool {
+    if contains_watchpoint_trigger(output) {
+        return false;
+    }
+    output.lines().any(|line| {
+        let trimmed = line.trim_start().to_ascii_lowercase();
+        (trimmed.starts_with("hardware watchpoint ")
+            || trimmed.starts_with("hardware access")
+            || trimmed.starts_with("watchpoint "))
+            && trimmed.contains(':')
+    })
+}
+
+/// Extract the watchpoint id from trigger output like "Hardware watchpoint 2: x".
+fn parse_watchpoint_stop_id(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let lower = line.to_ascii_lowercase();
+        let Some(idx) = lower.find("watchpoint ") else {
+            continue;
+        };
+        let rest = &line[idx + "watchpoint ".len()..];
+        let id: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+    None
 }
 
 fn parse_path_and_line(frame_output: &str) -> (Option<String>, Option<u64>) {
     for line in frame_output.lines() {
         if let Some(at_idx) = line.find(" at ") {
             let segment = line[(at_idx + 4)..].trim();
-            if let Some((path, line_number)) = segment.rsplit_once(':') {
-                if let Ok(number) = line_number.parse::<u64>() {
-                    return (Some(path.to_string()), Some(number));
-                }
+            if let Some((path, line_number)) = segment.rsplit_once(':')
+                && let Ok(number) = line_number.parse::<u64>()
+            {
+                return (Some(path.to_string()), Some(number));
             }
         }
     }
@@ -1416,21 +2020,6 @@ fn parse_gdb_list_line(line: &str) -> Option<(u64, &str)> {
         rest
     };
     Some((number, source))
-}
-
-fn parse_breakpoint_location_line(line: &str) -> Option<(String, String, u64)> {
-    let trimmed = line.trim_start();
-    let mut parts = trimmed.split_whitespace();
-    let id = parts.next()?;
-    if !id.chars().all(|char| char.is_ascii_digit() || char == '.') {
-        return None;
-    }
-
-    let at_idx = trimmed.rfind(" at ")?;
-    let location = trimmed[(at_idx + 4)..].trim();
-    let (path, line_no) = location.rsplit_once(':')?;
-    let line_number = line_no.parse::<u64>().ok()?;
-    Some((id.to_string(), path.to_string(), line_number))
 }
 
 fn parse_backtrace_lines(
@@ -1470,10 +2059,7 @@ fn parse_backtrace_frame_line(line: &str) -> Option<(u64, String, String)> {
 
     let mut function = rest.split_whitespace().next().unwrap_or("unknown");
     if function == "in" {
-        function = rest
-            .split_whitespace()
-            .nth(1)
-            .unwrap_or("unknown");
+        function = rest.split_whitespace().nth(1).unwrap_or("unknown");
     }
     if let Some((name, _)) = function.split_once('(') {
         function = name;
@@ -1489,7 +2075,154 @@ fn parse_backtrace_frame_line(line: &str) -> Option<(u64, String, String)> {
 
 #[cfg(test)]
 mod parse_tests {
-    use super::{parse_backtrace_frame_line, parse_gdb_list_line};
+    use super::{
+        contains_watchpoint_creation, contains_watchpoint_trigger, parse_backtrace_frame_line,
+        parse_breakpoint_entry, parse_breakpoint_stop_id, parse_examine_memory_rows,
+        parse_gdb_list_line, resolve_breakpoint_ids_from_listing,
+    };
+
+    #[test]
+    fn test_breakpoint_stop_id_matches_hits_not_creation() {
+        let stop = "\nBreakpoint 1, app_run () at src/main.c:30\n";
+        assert_eq!(parse_breakpoint_stop_id(stop).as_deref(), Some("1"));
+
+        let creation = "Breakpoint 1 at 0x1234: file /tmp/main.c, line 10.\n";
+        assert_eq!(parse_breakpoint_stop_id(creation), None);
+
+        let none = "0x00005555 in compute_pi ()\n";
+        assert_eq!(parse_breakpoint_stop_id(none), None);
+    }
+
+    #[test]
+    fn test_resolve_ids_by_listing_number_and_location() {
+        let listing = "Num Type           Disp Enb Address            What\n\
+1   breakpoint     keep y   0x0001 in main at /tmp/src/main.c:55\n\
+2   breakpoint     keep y   0x0002 in helper\n\
+3   hw watchpoint  keep y                      counter\n";
+
+        // Pure breakpoint numbers never reach the resolver: they are handled
+        // directly by parse_breakpoint_number in the tool handlers, so a
+        // location lookup for "1" correctly matches nothing here.
+        assert_eq!(
+            resolve_breakpoint_ids_from_listing(listing, "1"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            resolve_breakpoint_ids_from_listing(listing, "/tmp/src/main.c:55"),
+            vec!["1".to_string()]
+        );
+        // Relative path matching the same entry.
+        assert_eq!(
+            resolve_breakpoint_ids_from_listing(listing, "src/main.c:55"),
+            vec!["1".to_string()]
+        );
+        assert_eq!(
+            resolve_breakpoint_ids_from_listing(listing, "helper"),
+            vec!["2".to_string()]
+        );
+        // Watchpoints are listed too and resolvable by expression.
+        assert_eq!(
+            resolve_breakpoint_ids_from_listing(listing, "counter"),
+            vec!["3".to_string()]
+        );
+        assert!(resolve_breakpoint_ids_from_listing(listing, "*0xdeadbeef").is_empty());
+    }
+
+    #[test]
+    fn test_resolve_ids_address_entry() {
+        let listing = "Num Type           Disp Enb Address            What\n\
+4   breakpoint     keep y   0x0004005a0 in _start\n";
+        assert_eq!(
+            resolve_breakpoint_ids_from_listing(listing, "*0x4005a0"),
+            vec!["4".to_string()],
+            "address target should match the Address column"
+        );
+    }
+
+    #[test]
+    fn test_resolve_ids_with_wrapped_listing_lines() {
+        // Real gdb wraps long rows; the location sits on a continuation line.
+        let listing = "Num     Type           Disp Enb Address            What\n\
+1       breakpoint     keep y   0x000055db57319155 in main\n\
+                                                   at /tmp/opencode/dbg_app.c:5\n\
+\tbreakpoint already hit 1 time\n\
+2       hw watchpoint  keep y                      counter\n";
+        assert_eq!(
+            resolve_breakpoint_ids_from_listing(listing, "dbg_app.c:5"),
+            vec!["1".to_string()],
+            "wrapped continuation lines must be folded into their entry"
+        );
+        assert_eq!(
+            resolve_breakpoint_ids_from_listing(listing, "/tmp/opencode/dbg_app.c:5"),
+            vec!["1".to_string()]
+        );
+        assert_eq!(
+            resolve_breakpoint_ids_from_listing(listing, "counter"),
+            vec!["2".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_resolve_ids_word_boundaries_reject_substring_matches() {
+        let listing = "Num Type           Disp Enb Address            What\n\
+1   breakpoint     keep y   0x0001 in main at /tmp/opencode/dbg_app.c:55\n\
+2   breakpoint     keep y   0x0002 in helper at /tmp/other.c:5\n";
+        // "app" is a substring of dbg_app.c but not a word-boundary match.
+        assert!(resolve_breakpoint_ids_from_listing(listing, "app").is_empty());
+        // ":5" must not match ":55".
+        assert_eq!(
+            resolve_breakpoint_ids_from_listing(listing, "dbg_app.c:5"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            resolve_breakpoint_ids_from_listing(listing, "dbg_app.c:55"),
+            vec!["1".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_parse_breakpoint_entry_columns() {
+        let entry = parse_breakpoint_entry(
+            "1",
+            "breakpoint keep y 0x000055db57319155 in main at /tmp/dbg_app.c:5 breakpoint already hit 1 time",
+        );
+        assert_eq!(entry.number, "1");
+        assert_eq!(entry.kind, "breakpoint");
+        assert!(entry.enabled);
+        assert!(entry.detail.contains("in main"));
+
+        let disabled_watch = parse_breakpoint_entry("3", "hw watchpoint keep n counter");
+        assert_eq!(disabled_watch.kind, "hw watchpoint");
+        assert!(!disabled_watch.enabled);
+        assert_eq!(disabled_watch.detail, "counter");
+    }
+
+    #[test]
+    fn test_examine_memory_rows_parse() {
+        let output = "(gdb) 0x404050 <counter>:\t0x00000005\t0x00000000\n\
+0x404058:\t0xffffffff\t0x00000001\n";
+        let rows = parse_examine_memory_rows(output);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.get("0x404050").map(String::as_str),
+            Some("0x00000005\t0x00000000")
+        );
+        assert_eq!(
+            rows.get("0x404058").map(String::as_str),
+            Some("0xffffffff\t0x00000001")
+        );
+    }
+
+    #[test]
+    fn test_watchpoint_trigger_vs_creation() {
+        let trigger = "Hardware watchpoint 2: counter\n\nOld value = 5\nNew value = 10\n";
+        assert!(contains_watchpoint_trigger(trigger));
+        assert!(!contains_watchpoint_creation(trigger));
+
+        let creation = "Hardware watchpoint 2: counter\n(gdb) ";
+        assert!(contains_watchpoint_creation(creation));
+        assert!(!contains_watchpoint_trigger(creation));
+    }
 
     #[test]
     fn test_parse_gdb_list_line_preserves_space_indentation() {

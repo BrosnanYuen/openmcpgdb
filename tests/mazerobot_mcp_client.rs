@@ -1,9 +1,5 @@
 use anyhow::Result;
-use openmcpgdb::{
-    ServerConfig,
-    gdb::RealGdbBackendFactory,
-    server::OpenMcpGdbServerFactory,
-};
+use openmcpgdb::{ServerConfig, gdb::RealGdbBackendFactory, server::OpenMcpGdbServerFactory};
 use rmcp::{
     ClientHandler, ServiceExt,
     model::{CallToolRequestParams, ClientInfo, ContentBlock},
@@ -52,7 +48,10 @@ async fn ensure_mazerobot_executable() -> Result<()> {
         .status()
         .await?;
 
-    anyhow::ensure!(status.success(), "chmod +x ./examples/mazerobot/maze_robot failed");
+    anyhow::ensure!(
+        status.success(),
+        "chmod +x ./examples/mazerobot/maze_robot failed"
+    );
     Ok(())
 }
 
@@ -65,7 +64,7 @@ async fn test_mcp_server_with_mazerobot_binary() -> Result<()> {
 
     ensure_mazerobot_executable().await?;
 
-    let config = mazerobot_config();
+    let mut config = mazerobot_config();
     config.validate()?;
 
     let factory = OpenMcpGdbServerFactory::new(config, Arc::new(RealGdbBackendFactory));
@@ -141,13 +140,15 @@ fn parse_debugger_response(result: &rmcp::model::CallToolResult) -> serde_json::
 #[tokio::test]
 async fn test_bug_invalid_print_symbol_is_recoverable_without_reset() -> Result<()> {
     if !has_required_paths() {
-        eprintln!("Skipping test_bug_invalid_print_symbol_is_recoverable_without_reset: required paths missing");
+        eprintln!(
+            "Skipping test_bug_invalid_print_symbol_is_recoverable_without_reset: required paths missing"
+        );
         return Ok(());
     }
 
     ensure_mazerobot_executable().await?;
 
-    let config = mazerobot_config();
+    let mut config = mazerobot_config();
     config.validate()?;
 
     let factory = OpenMcpGdbServerFactory::new(config, Arc::new(RealGdbBackendFactory));
@@ -178,8 +179,7 @@ async fn test_bug_invalid_print_symbol_is_recoverable_without_reset() -> Result<
         .call_tool(
             CallToolRequestParams::new("gdb_add_breakpoint").with_arguments(
                 serde_json::json!({
-                    "filename": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c",
-                    "linenumber": 55
+                    "location": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c:55"
                 })
                 .as_object()
                 .expect("breakpoint args should be object")
@@ -248,13 +248,15 @@ async fn test_bug_invalid_print_symbol_is_recoverable_without_reset() -> Result<
 #[tokio::test]
 async fn test_bug_continue_while_running_returns_running_state() -> Result<()> {
     if !has_required_paths() {
-        eprintln!("Skipping test_bug_continue_while_running_returns_running_state: required paths missing");
+        eprintln!(
+            "Skipping test_bug_continue_while_running_returns_running_state: required paths missing"
+        );
         return Ok(());
     }
 
     ensure_mazerobot_executable().await?;
 
-    let config = mazerobot_config();
+    let mut config = mazerobot_config();
     config.validate()?;
 
     let factory = OpenMcpGdbServerFactory::new(config, Arc::new(RealGdbBackendFactory));
@@ -285,8 +287,7 @@ async fn test_bug_continue_while_running_returns_running_state() -> Result<()> {
         .call_tool(
             CallToolRequestParams::new("gdb_add_breakpoint").with_arguments(
                 serde_json::json!({
-                    "filename": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c",
-                    "linenumber": 55
+                    "location": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c:55"
                 })
                 .as_object()
                 .expect("breakpoint args should be object")
@@ -305,8 +306,7 @@ async fn test_bug_continue_while_running_returns_running_state() -> Result<()> {
         .call_tool(
             CallToolRequestParams::new("gdb_clear_breakpoint").with_arguments(
                 serde_json::json!({
-                    "filename": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c",
-                    "linenumber": 55
+                    "location": "/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c:55"
                 })
                 .as_object()
                 .expect("clear args should be object")

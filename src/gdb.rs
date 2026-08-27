@@ -79,8 +79,12 @@ impl GdbBackend for RealGdbBackend {
         for option in self.config.gdb_options.split_whitespace() {
             command.arg(option);
         }
+        // An empty path starts bare gdb (used by attach-to-pid, which loads
+        // symbol information from the live process instead).
+        if !executable_path.as_os_str().is_empty() {
+            command.arg(executable_path);
+        }
         command
-            .arg(executable_path)
             .arg("--quiet")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -208,14 +212,14 @@ impl GdbBackend for RealGdbBackend {
     }
 
     async fn interrupt(&mut self) -> Result<()> {
-        if let Some(child) = self.child.as_mut() {
-            if let Some(pid) = child.id() {
-                // Send SIGINT to the gdb process to interrupt it.
-                // This will cause gdb to stop the running debuggee and return to the prompt.
-                let _ = unsafe { libc::kill(pid as i32, libc::SIGINT) };
-                // Give gdb a moment to process the signal.
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
+        if let Some(child) = self.child.as_mut()
+            && let Some(pid) = child.id()
+        {
+            // Send SIGINT to the gdb process to interrupt it.
+            // This will cause gdb to stop the running debuggee and return to the prompt.
+            let _ = unsafe { libc::kill(pid as i32, libc::SIGINT) };
+            // Give gdb a moment to process the signal.
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Ok(())
     }
@@ -254,9 +258,7 @@ impl MockBackendHandle {
 
     pub fn set_error(&self, command: &str, error: &str) {
         if let Ok(mut state) = self.inner.lock() {
-            state
-                .errors
-                .insert(command.to_string(), error.to_string());
+            state.errors.insert(command.to_string(), error.to_string());
         }
     }
 

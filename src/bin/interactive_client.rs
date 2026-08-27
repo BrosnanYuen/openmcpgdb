@@ -77,15 +77,15 @@ fn sort_json_for_display(value: Value) -> Value {
 
 fn format_response_for_display(value: Value) -> (Value, Option<String>) {
     if let Value::Object(mut object) = value {
-        if let Some(Value::String(code)) = object.get("current_code") {
-            if code.contains('\n') {
-                let code_block = code.clone();
-                object.insert(
-                    "current_code".to_string(),
-                    Value::String("<multiline output below>".to_string()),
-                );
-                return (Value::Object(object), Some(code_block));
-            }
+        if let Some(Value::String(code)) = object.get("current_code")
+            && code.contains('\n')
+        {
+            let code_block = code.clone();
+            object.insert(
+                "current_code".to_string(),
+                Value::String("<multiline output below>".to_string()),
+            );
+            return (Value::Object(object), Some(code_block));
         }
         return (Value::Object(object), None);
     }
