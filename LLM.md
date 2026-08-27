@@ -49,10 +49,10 @@ Rules:
 
 Examples of Debugging on  Local GDB:
 ```text
-gdb_execute {"executable_path":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/maze_robot"}
+gdb_execute {"executable_path":"/absolute/path/to/mazerobot/maze_robot"}
 gdb_debugger_state {}
 gdb_add_variable_list {"var":"robot->sim->robot_row"}
-gdb_add_breakpoint {"location":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c:20"}
+gdb_add_breakpoint {"location":"/absolute/path/to/mazerobot/src/main.c:20"}
 gdb_run {}
 gdb_next {}
 gdb_step {}
@@ -70,7 +70,7 @@ gdb_gdbserver {"ip":"127.0.0.1","port":11444,"pid":149104}
 gdb_target_remote {"ip":"127.0.0.1","port":11444}
 gdb_debugger_state {}
 gdb_add_variable_list {"var":"robot->sim->robot_row"}
-gdb_add_breakpoint {"location":"/home/brosnan/openmcpgdb/openmcpgdb/examples/mazerobot/src/main.c:20"}
+gdb_add_breakpoint {"location":"/absolute/path/to/mazerobot/src/main.c:20"}
 gdb_continue {}
 gdb_next {}
 gdb_step {}
@@ -410,7 +410,6 @@ gdb_disassemble {"address":"main"}
 gdb_examine_memory {"address":"&counter","count":4,"format":"x","size":"w"}
 ```
 
-`gdb_custom`
 ### Control and Server Display Tuning
 
 `gdb_quit`

@@ -175,7 +175,7 @@ impl GdbBackend for RealGdbBackend {
         if let Some(stderr) = self.stderr.as_mut() {
             loop {
                 let mut buf = [0u8; 1024];
-                match timeout(Duration::from_millis(20), stderr.read(&mut buf)).await {
+                match timeout(Duration::from_millis(50), stderr.read(&mut buf)).await {
                     Ok(Ok(0)) => break,
                     Ok(Ok(count)) => {
                         output.push_str(&String::from_utf8_lossy(&buf[..count]));

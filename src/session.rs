@@ -302,13 +302,13 @@ impl<'a> SessionCore<'a> {
                 location,
                 condition,
             } => {
-                let mut command = format!("break {location}");
+                let mut command = format!("break {}", sanitize_gdb_input(&location));
                 if let Some(condition) = condition
                     .as_deref()
                     .map(str::trim)
                     .filter(|condition| !condition.is_empty())
                 {
-                    command.push_str(&format!(" if {condition}"));
+                    command.push_str(&format!(" if {}", sanitize_gdb_input(condition)));
                 }
                 self.execute_recoverable_command_with_output(&command, None)
                     .await
@@ -365,8 +365,15 @@ impl<'a> SessionCore<'a> {
             }
             ToolOperation::Print { expression } => self.execute_print(&expression).await,
             ToolOperation::SetVar { var, value } => {
-                self.execute_command(&format!("set variable {var} = {value}"), None)
-                    .await
+                self.execute_command(
+                    &format!(
+                        "set variable {} = {}",
+                        sanitize_gdb_input(&var),
+                        sanitize_gdb_input(&value)
+                    ),
+                    None,
+                )
+                .await
             }
             ToolOperation::InfoRegs => {
                 if self.debugger_state == DebuggerState::NotAttached
@@ -628,7 +635,7 @@ impl<'a> SessionCore<'a> {
     async fn execute_print(&mut self, var: &str) -> Result<DebuggerResponse> {
         let previous_state = self.debugger_state;
         let response = self
-            .execute_command_with_output(&format!("print {var}"), None)
+            .execute_command_with_output(&format!("print {}", sanitize_gdb_input(var)), None)
             .await?;
 
         if response.debugger_state != DebuggerState::Error {
@@ -733,18 +740,18 @@ impl<'a> SessionCore<'a> {
             return Ok(self.base_response());
         }
 
+        if self.debugger_state == DebuggerState::Running {
+            let _ = self.backend.interrupt().await;
+            let _ = self.backend.exec("printf \"\"").await;
+            self.debugger_state = DebuggerState::StoppedAtStepping;
+        }
+
         // Numbers go straight to `delete N`; locations resolve to numbers first
         // so watchpoints and symbol locations delete reliably.
         if let Some(id) = parse_breakpoint_number(&target) {
             return self
                 .execute_command_with_output(&format!("delete {id}"), None)
                 .await;
-        }
-
-        if self.debugger_state == DebuggerState::Running {
-            let _ = self.backend.interrupt().await;
-            let _ = self.backend.exec("printf \"\"").await;
-            self.debugger_state = DebuggerState::StoppedAtStepping;
         }
 
         let ids = match self.resolve_breakpoint_ids_by_location(&target).await {
@@ -762,7 +769,14 @@ impl<'a> SessionCore<'a> {
             return Ok(self.base_response().with_error(self.last_error.clone()));
         }
 
-        let command = format!("delete {}", ids.join(" "));
+        // GDB's `delete 1.1` fails with "bad breakpoint number", but `delete 1`
+        // correctly removes all sub-breakpoints (1.1, 1.2). Collapse sub-ids to parents.
+        let mut parents = std::collections::BTreeSet::new();
+        for id in ids {
+            let parent = id.split('.').next().unwrap_or(&id).to_string();
+            parents.insert(parent);
+        }
+        let command = format!("delete {}", parents.into_iter().collect::<Vec<_>>().join(" "));
         self.execute_command_with_output(&command, None).await
     }
 
@@ -815,7 +829,7 @@ impl<'a> SessionCore<'a> {
         expression: &str,
         mode: WatchMode,
     ) -> Result<DebuggerResponse> {
-        let command = format!("{} {}", mode.command(), expression);
+        let command = format!("{} {}", mode.command(), sanitize_gdb_input(expression));
         self.execute_recoverable_command_with_output(&command, None)
             .await
     }
@@ -853,7 +867,10 @@ impl<'a> SessionCore<'a> {
             return Ok(self.base_response().with_error(self.last_error.clone()));
         }
 
-        let command = format!("x/{count}{format}{size} {address}");
+        let command = format!(
+            "x/{count}{format}{size} {}",
+            sanitize_gdb_input(address)
+        );
         let response = self
             .execute_recoverable_command_with_output(&command, None)
             .await?;
@@ -964,7 +981,7 @@ impl<'a> SessionCore<'a> {
     /// Disassemble the current function or around an address/symbol.
     async fn execute_disassemble(&mut self, address: Option<&str>) -> Result<DebuggerResponse> {
         let command = match address.map(str::trim).filter(|a| !a.is_empty()) {
-            Some(address) => format!("disassemble {address}"),
+            Some(address) => format!("disassemble {}", sanitize_gdb_input(address)),
             None => "disassemble".to_string(),
         };
         self.execute_recoverable_command_with_output(&command, None)
@@ -1277,7 +1294,10 @@ impl<'a> SessionCore<'a> {
             .iter()
             .take(self.config.display_variable_list)
         {
-            let output = self.backend.exec(&format!("print {variable}")).await;
+            let output = self
+                .backend
+                .exec(&format!("print {}", sanitize_gdb_input(variable)))
+                .await;
             match output {
                 Ok(output) => {
                     let value = if looks_like_gdb_error(&output) {
@@ -1660,12 +1680,19 @@ fn parse_breakpoint_number(target: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    let valid = trimmed.chars().all(|c| c.is_ascii_digit() || c == '.');
-    if valid && trimmed.chars().any(|c| c.is_ascii_digit()) {
-        Some(trimmed.to_string())
-    } else {
-        None
+    let mut parts = trimmed.split('.');
+    let first = parts.next()?;
+    if first.is_empty() || !first.chars().all(|c| c.is_ascii_digit()) {
+        return None;
     }
+    if let Some(second) = parts.next()
+        && (second.is_empty()
+            || !second.chars().all(|c| c.is_ascii_digit())
+            || parts.next().is_some())
+    {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 fn resolve_breakpoint_ids_from_listing(listing: &str, location: &str) -> Vec<String> {
@@ -1862,6 +1889,10 @@ fn parse_examine_memory_rows(output: &str) -> BTreeMap<String, String> {
     rows
 }
 
+fn sanitize_gdb_input(input: &str) -> String {
+    input.replace(['\n', '\r'], " ")
+}
+
 fn normalize_gdb_value(output: &str) -> String {
     let trimmed = output.trim();
     if trimmed.is_empty() {
@@ -1939,9 +1970,11 @@ fn parse_breakpoint_stop_id(output: &str) -> Option<String> {
             Some(rest) => rest,
             None => continue,
         };
-        let id: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if !id.is_empty() && rest[id.len()..].starts_with(',') {
-            return Some(id);
+        if let Some(comma_idx) = rest.find(',') {
+            let id_part = rest[..comma_idx].trim();
+            if parse_breakpoint_number(id_part).is_some() {
+                return Some(id_part.to_string());
+            }
         }
     }
     None

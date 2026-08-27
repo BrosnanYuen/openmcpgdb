@@ -123,9 +123,9 @@ struct ExamineMemoryArgs {
     count: Option<u32>,
     /// Display format: x hex, d decimal, u unsigned, o octal, t binary,
     /// c char, s string, i instruction (default x).
-    format: Option<char>,
+    format: Option<String>,
     /// Item size: b byte, h halfword, w word, g giant/8 bytes (default w).
-    size: Option<char>,
+    size: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -324,8 +324,16 @@ impl OpenMcpGdbServer {
         self.call_operation(ToolOperation::ExamineMemory {
             address: args.address,
             count: args.count.unwrap_or(16),
-            format: args.format.unwrap_or('x'),
-            size: args.size.unwrap_or('w'),
+            format: args
+                .format
+                .as_deref()
+                .and_then(|s| s.chars().next())
+                .unwrap_or('x'),
+            size: args
+                .size
+                .as_deref()
+                .and_then(|s| s.chars().next())
+                .unwrap_or('w'),
         })
         .await
     }

@@ -115,9 +115,9 @@ impl ServerConfig {
     /// they stay valid regardless of later working-directory changes.
     pub fn validate(&mut self) -> Result<()> {
         self.gdb_path = resolve_gdb_path(&self.gdb_path)?;
-        self.codebase_dir = make_absolute(&self.codebase_dir);
+        self.codebase_dir = make_absolute(&self.codebase_dir)?;
         if !self.executable_path.as_os_str().is_empty() {
-            self.executable_path = make_absolute(&self.executable_path);
+            self.executable_path = make_absolute(&self.executable_path)?;
         }
         if self.display_backtrace == 0 {
             return Err(OpenMcpGdbError::InvalidConfig(
@@ -140,7 +140,7 @@ fn resolve_gdb_path(gdb_path: &Path) -> Result<PathBuf> {
         gdb_path.to_path_buf()
     } else if gdb_path.components().count() > 1 {
         // Contains a directory component (e.g. ./gdb or tools/gdb): relative to cwd.
-        make_absolute(gdb_path)
+        make_absolute(gdb_path)?
     } else {
         find_in_path(gdb_path).ok_or_else(|| {
             OpenMcpGdbError::InvalidConfig(format!(
@@ -162,17 +162,56 @@ fn resolve_gdb_path(gdb_path: &Path) -> Result<PathBuf> {
 fn find_in_path(command: &Path) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     std::env::split_paths(&path_var)
+        .filter(|dir| !dir.as_os_str().is_empty())
         .map(|dir| dir.join(command))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| {
+            if !candidate.is_file() {
+                return false;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                candidate
+                    .metadata()
+                    .map(|m| m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            }
+            #[cfg(not(unix))]
+            {
+                true
+            }
+        })
 }
 
-fn make_absolute(path: &Path) -> PathBuf {
+fn make_absolute(path: &Path) -> Result<PathBuf> {
     if path.is_absolute() {
-        path.to_path_buf()
+        Ok(clean_path(path))
     } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
+        let cwd = std::env::current_dir().map_err(|err| {
+            OpenMcpGdbError::InvalidConfig(format!(
+                "cannot determine current directory to resolve {}: {err}",
+                path.display()
+            ))
+        })?;
+        Ok(clean_path(&cwd.join(path)))
+    }
+}
+
+fn clean_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            _ => out.push(component.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
     }
 }
 
