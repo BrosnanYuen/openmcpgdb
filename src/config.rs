@@ -10,10 +10,18 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// GDB binary. May be an absolute path or a command name resolved via `PATH`.
+    /// For multi-arch (e.g. x64 host -> aarch64 target via `target remote`), set this to a multi-arch capable GDB:
+    /// `gdb-multiarch`, `aarch64-linux-gnu-gdb`, etc. Native `gdb` cannot load a foreign ELF (`File format not recognized`).
     #[serde(default = "default_gdb_path")]
     pub gdb_path: PathBuf,
     #[serde(default)]
     pub gdb_options: String,
+    /// gdbserver binary for `gdb_gdbserver` (local attach only). Bare name is resolved via `PATH`, not the current directory.
+    /// For your primary remote use-case where *another host* already runs `gdbserver`, you never call `gdb_gdbserver`
+    /// and this field is ignored - it may stay at the default `gdbserver` even if not installed locally. The `gdbserver`
+    /// binary that matters for aarch64 is the one on the *remote* host, not here.
+    #[serde(default = "default_gdbserver_path")]
+    pub gdbserver_path: PathBuf,
     /// Source root used to resolve relative source paths reported by gdb.
     /// Defaults to the directory the server was started from.
     #[serde(default = "default_codebase_dir")]
@@ -44,6 +52,10 @@ pub struct ServerConfig {
 
 fn default_gdb_path() -> PathBuf {
     PathBuf::from("gdb")
+}
+
+fn default_gdbserver_path() -> PathBuf {
+    PathBuf::from("gdbserver")
 }
 
 fn default_codebase_dir() -> PathBuf {
@@ -80,6 +92,7 @@ impl Default for ServerConfig {
         Self {
             gdb_path: default_gdb_path(),
             gdb_options: String::new(),
+            gdbserver_path: default_gdbserver_path(),
             codebase_dir: default_codebase_dir(),
             executable_path: PathBuf::new(),
             mcp_server_name: default_server_name(),
@@ -115,6 +128,7 @@ impl ServerConfig {
     /// they stay valid regardless of later working-directory changes.
     pub fn validate(&mut self) -> Result<()> {
         self.gdb_path = resolve_gdb_path(&self.gdb_path)?;
+        self.gdbserver_path = resolve_gdbserver_path(&self.gdbserver_path)?;
         self.codebase_dir = make_absolute(&self.codebase_dir)?;
         if !self.executable_path.as_os_str().is_empty() {
             self.executable_path = make_absolute(&self.executable_path)?;
@@ -157,6 +171,48 @@ fn resolve_gdb_path(gdb_path: &Path) -> Result<PathBuf> {
         )));
     }
     Ok(candidate)
+}
+
+/// Resolve gdbserver binary: similar to gdb but soft-fails when the default
+/// bare name is not found so that `target remote`-only setups (your primary
+/// use case) don't require gdbserver locally. Explicit paths still validate.
+fn resolve_gdbserver_path(gdbserver_path: &Path) -> Result<PathBuf> {
+    let default = default_gdbserver_path();
+    let candidate = if gdbserver_path.is_absolute() {
+        gdbserver_path.to_path_buf()
+    } else if gdbserver_path.components().count() > 1 {
+        make_absolute(gdbserver_path)?
+    } else if let Some(found) = find_in_path(gdbserver_path) {
+        found
+    } else if gdbserver_path == default {
+        // Default not required for remote-only use; keep bare name and defer error to spawn.
+        return Ok(default);
+    } else {
+        return Err(OpenMcpGdbError::InvalidConfig(format!(
+            "gdbserver binary {:?} not found in PATH; set gdbserver_path in the config to an absolute location or install gdbserver",
+            gdbserver_path.display()
+        )));
+    };
+
+    // If we resolved an absolute/path-with-dir candidate, validate it.
+    // For the bare-default fallback we already returned above.
+    if candidate != default && !candidate.is_file() {
+        return Err(OpenMcpGdbError::InvalidConfig(format!(
+            "gdbserver_path {:?} does not exist or is not a regular file",
+            candidate.display()
+        )));
+    }
+    // If candidate is the default but we did find it, it's a file (found via PATH), otherwise it's the bare fallback.
+    if candidate.is_file() {
+        Ok(candidate)
+    } else if candidate == default {
+        Ok(default)
+    } else {
+        Err(OpenMcpGdbError::InvalidConfig(format!(
+            "gdbserver_path {:?} does not exist or is not a regular file",
+            candidate.display()
+        )))
+    }
 }
 
 fn find_in_path(command: &Path) -> Option<PathBuf> {
@@ -235,6 +291,7 @@ mod tests {
     fn default_config_matches_documented_defaults() {
         let config = ServerConfig::default();
         assert_eq!(config.gdb_path, PathBuf::from("gdb"));
+        assert_eq!(config.gdbserver_path, PathBuf::from("gdbserver"));
         assert_eq!(config.mcp_server_url, "stdio://");
         assert_eq!(config.mcp_server_name, "MCP GDB Server");
         assert_eq!(config.codebase_dir, PathBuf::from("."));

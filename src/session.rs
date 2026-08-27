@@ -28,6 +28,19 @@ pub enum ToolOperation {
         ip: String,
         port: u16,
     },
+    TargetExtendedRemote {
+        ip: String,
+        port: u16,
+    },
+    SetSysroot {
+        path: String,
+    },
+    SetSolibSearchPath {
+        path: String,
+    },
+    SetArchitecture {
+        arch: String,
+    },
     SetThread {
         id: i64,
     },
@@ -205,6 +218,8 @@ struct SessionCore<'a> {
     executable_path: Option<PathBuf>,
     gdbserver_child: Option<tokio::process::Child>,
     last_error: String,
+    /// True after a successful `target remote` / `extended-remote` until quit/detach/reset.
+    is_remote: bool,
 }
 
 impl<'a> SessionCore<'a> {
@@ -270,6 +285,7 @@ impl<'a> SessionCore<'a> {
             executable_path: None,
             gdbserver_child: None,
             last_error: String::new(),
+            is_remote: false,
         }
     }
 
@@ -289,7 +305,17 @@ impl<'a> SessionCore<'a> {
             ToolOperation::GdbServer { ip, port, pid } => {
                 self.execute_gdbserver(ip, port, pid).await
             }
-            ToolOperation::TargetRemote { ip, port } => self.execute_target_remote(ip, port).await,
+            ToolOperation::TargetRemote { ip, port } => {
+                self.execute_target_remote(ip, port, false).await
+            }
+            ToolOperation::TargetExtendedRemote { ip, port } => {
+                self.execute_target_remote(ip, port, true).await
+            }
+            ToolOperation::SetSysroot { path } => self.execute_set_sysroot(&path).await,
+            ToolOperation::SetSolibSearchPath { path } => {
+                self.execute_set_solib_search_path(&path).await
+            }
+            ToolOperation::SetArchitecture { arch } => self.execute_set_architecture(&arch).await,
             ToolOperation::SetThread { id } => {
                 self.execute_recoverable_command_with_output(&format!("thread {id}"), None)
                     .await
@@ -355,7 +381,7 @@ impl<'a> SessionCore<'a> {
                 self.watched_variables.retain(|existing| existing != &var);
                 self.variable_list_response().await
             }
-            ToolOperation::DebuggerState => Ok(self.base_response()),
+            ToolOperation::DebuggerState => self.debugger_state_response().await,
             ToolOperation::VariableList => self.variable_list_response().await,
             ToolOperation::CurrentCode => self.current_code_response().await,
             ToolOperation::FullBacktrace => self.full_backtrace_response().await,
@@ -390,6 +416,7 @@ impl<'a> SessionCore<'a> {
                     let _ = self.stop_gdbserver_process().await;
                     let _ = self.backend.stop().await;
                     self.debugger_state = DebuggerState::NotAttached;
+                    self.is_remote = false;
                     self.last_error.clear();
                     self.watched_variables.clear();
                     return Ok(self.base_response());
@@ -406,6 +433,7 @@ impl<'a> SessionCore<'a> {
                     (Ok(_), Ok(_)) => {
                         self.debugger_state = DebuggerState::NotAttached;
                         self.executable_path = None;
+                        self.is_remote = false;
                         self.watched_variables.clear();
                         self.last_error.clear();
                         self.stop_reason = None;
@@ -431,6 +459,7 @@ impl<'a> SessionCore<'a> {
                 let _ = self.backend.stop().await;
                 self.debugger_state = DebuggerState::NotAttached;
                 self.executable_path = None;
+                self.is_remote = false;
                 self.watched_variables.clear();
                 self.last_error.clear();
                 self.stop_reason = None;
@@ -474,7 +503,29 @@ impl<'a> SessionCore<'a> {
                 self.execute_disassemble(address.as_deref()).await
             }
             ToolOperation::FrameInfo => self.execute_frame_info().await,
-            ToolOperation::Custom { cmd } => self.execute_command_with_output(&cmd, None).await,
+            ToolOperation::Custom { cmd } => {
+                let trimmed = cmd.trim_start().to_ascii_lowercase();
+                let is_remote_cmd = trimmed.starts_with("target remote")
+                    || trimmed.starts_with("target extended-remote");
+                let resp = self.execute_command_with_output(&cmd, None).await?;
+                if is_remote_cmd && resp.debugger_state != DebuggerState::Error {
+                    // Custom remote target succeeded; track remote mode for run guards.
+                    // GDB's success prints "Remote debugging using ..." and state stays Attached.
+                    if resp.debugger_state == DebuggerState::Attached
+                        || resp.debugger_state == DebuggerState::StoppedAtBreakpoint
+                        || resp.debugger_state == DebuggerState::StoppedAtStepping
+                    {
+                        self.is_remote = true;
+                    }
+                }
+                // Clearing remote flag on disconnect/detach via custom.
+                if (trimmed.starts_with("detach") || trimmed.starts_with("disconnect"))
+                    && resp.debugger_state == DebuggerState::NotAttached
+                {
+                    self.is_remote = false;
+                }
+                Ok(resp)
+            }
         }
     }
 
@@ -529,6 +580,7 @@ impl<'a> SessionCore<'a> {
             Ok(_) => {
                 self.executable_path = Some(executable);
                 self.debugger_state = DebuggerState::Attached;
+                self.is_remote = false;
                 self.last_error.clear();
                 println!("[gdb_execute] success: gdb started for {}", executable_path);
                 Ok(self.base_response())
@@ -776,7 +828,10 @@ impl<'a> SessionCore<'a> {
             let parent = id.split('.').next().unwrap_or(&id).to_string();
             parents.insert(parent);
         }
-        let command = format!("delete {}", parents.into_iter().collect::<Vec<_>>().join(" "));
+        let command = format!(
+            "delete {}",
+            parents.into_iter().collect::<Vec<_>>().join(" ")
+        );
         self.execute_command_with_output(&command, None).await
     }
 
@@ -867,10 +922,7 @@ impl<'a> SessionCore<'a> {
             return Ok(self.base_response().with_error(self.last_error.clone()));
         }
 
-        let command = format!(
-            "x/{count}{format}{size} {}",
-            sanitize_gdb_input(address)
-        );
+        let command = format!("x/{count}{format}{size} {}", sanitize_gdb_input(address));
         let response = self
             .execute_recoverable_command_with_output(&command, None)
             .await?;
@@ -940,6 +992,7 @@ impl<'a> SessionCore<'a> {
         // Record a truthful absolute path so "attached" invariants hold.
         self.executable_path = Some(PathBuf::from(format!("/proc/{pid}/exe")));
         self.debugger_state = DebuggerState::Attached;
+        self.is_remote = false;
         self.last_error.clear();
         self.stop_reason = None;
         let mut enriched = self.base_response();
@@ -969,9 +1022,20 @@ impl<'a> SessionCore<'a> {
         }
         if self.debugger_state == DebuggerState::NotAttached {
             self.executable_path = None;
+            self.is_remote = false;
             self.watched_variables.clear();
             self.last_error.clear();
             self.stop_reason = None;
+        } else if self.is_remote && response.debugger_state != DebuggerState::Error {
+            // Successful detach from remote target clears remote flag.
+            let out_lower = response
+                .command_output
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if out_lower.contains("detaching") || out_lower.contains("disconnected") {
+                self.is_remote = false;
+            }
         }
         let mut final_response = self.base_response();
         final_response.command_output = response.command_output;
@@ -1014,6 +1078,11 @@ impl<'a> SessionCore<'a> {
     }
 
     async fn execute_run(&mut self) -> Result<DebuggerResponse> {
+        if self.is_remote {
+            self.debugger_state = DebuggerState::Error;
+            self.last_error = "run is not valid for remote targets; use gdb_continue (and gdb_target_remote / gdb_target_extended_remote was used for remote debugging)".to_string();
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
         let response = self
             .execute_command("run", Some(DebuggerState::Running))
             .await?;
@@ -1041,52 +1110,82 @@ impl<'a> SessionCore<'a> {
         let _ = self.stop_gdbserver_process().await;
 
         let endpoint = format!("{ip}:{port}");
-        let mut command = tokio::process::Command::new("gdbserver");
+        let mut command = tokio::process::Command::new(&self.config.gdbserver_path);
         command
             .arg("--attach")
             .arg(&endpoint)
             .arg(pid.to_string())
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
 
         let child_result = command.spawn();
         let mut child = match child_result {
             Ok(child) => child,
             Err(err) => {
                 self.debugger_state = DebuggerState::GdbServerFailedToAttach;
-                self.last_error = format!("failed to start gdbserver: {err}");
+                self.last_error = format!(
+                    "failed to start gdbserver ({}): {err}",
+                    self.config.gdbserver_path.display()
+                );
                 return Ok(self.base_response().with_error(self.last_error.clone()));
             }
         };
 
-        sleep(Duration::from_millis(100)).await;
-        match child.try_wait().map_err(OpenMcpGdbError::Io)? {
-            Some(status) => {
-                self.debugger_state = DebuggerState::GdbServerFailedToAttach;
-                self.last_error = format!("gdbserver exited early with status: {status}");
-                Ok(self.base_response().with_error(self.last_error.clone()))
-            }
-            None => {
-                self.gdbserver_child = Some(child);
-                self.debugger_state = DebuggerState::GdbServerAttached;
-                self.last_error.clear();
-                Ok(self.base_response())
+        // Give gdbserver time to bind and fail fast if port is busy.
+        // Poll for up to ~600ms and capture stderr on early exit.
+        let mut early_status = None;
+        for _ in 0..6 {
+            sleep(Duration::from_millis(100)).await;
+            match child.try_wait().map_err(OpenMcpGdbError::Io)? {
+                Some(status) => {
+                    early_status = Some(status);
+                    break;
+                }
+                None => continue,
             }
         }
+        if let Some(status) = early_status {
+            // Try to collect stderr for diagnostics.
+            let mut stderr_buf = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                use tokio::io::AsyncReadExt as _;
+                let mut buf = Vec::new();
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(200), stderr.read_to_end(&mut buf))
+                        .await;
+                stderr_buf = String::from_utf8_lossy(&buf).trim().to_string();
+            }
+            self.debugger_state = DebuggerState::GdbServerFailedToAttach;
+            if stderr_buf.is_empty() {
+                self.last_error = format!("gdbserver exited early with status: {status}");
+            } else {
+                self.last_error =
+                    format!("gdbserver exited early with status: {status}: {stderr_buf}");
+            }
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
+        self.gdbserver_child = Some(child);
+        self.debugger_state = DebuggerState::GdbServerAttached;
+        self.last_error.clear();
+        Ok(self.base_response())
     }
 
-    async fn execute_target_remote(&mut self, ip: String, port: u16) -> Result<DebuggerResponse> {
+    async fn execute_target_remote(
+        &mut self,
+        ip: String,
+        port: u16,
+        extended: bool,
+    ) -> Result<DebuggerResponse> {
         // Remote attach still requires a local gdb process. If it is not started yet,
         // start gdb with configured executable for symbols before target remote.
         if self.executable_path.is_none() {
             if self.config.executable_path.as_os_str().is_empty() {
                 // executable_path is optional in the config; without a default
                 // binary we cannot start gdb for symbols here.
+                // For remote debugging the local symbol file should match the remote binary.
                 self.debugger_state = DebuggerState::FailedToAttach;
-                self.last_error = "no executable attached: run gdb_execute first, or set \
-                                   executable_path in the config"
-                    .to_string();
+                self.last_error = "no executable attached: run gdb_execute first with the local symbol file that matches the remote binary, or set executable_path in the config".to_string();
                 return Ok(self.base_response().with_error(self.last_error.clone()));
             }
             match self.backend.start(&self.config.executable_path).await {
@@ -1103,11 +1202,124 @@ impl<'a> SessionCore<'a> {
             }
         }
 
-        self.execute_command(
-            &format!("target remote {ip}:{port}"),
-            Some(DebuggerState::Attached),
-        )
-        .await
+        let cmd = if extended {
+            format!("target extended-remote {ip}:{port}")
+        } else {
+            format!("target remote {ip}:{port}")
+        };
+        let response = self
+            .execute_command(&cmd, Some(DebuggerState::Attached))
+            .await?;
+        // Track remote mode only on success; errors should not flip the flag.
+        // update_state_from_output will have set Error for connection failures.
+        if response.debugger_state == DebuggerState::Attached
+            || response.debugger_state == DebuggerState::StoppedAtBreakpoint
+            || response.debugger_state == DebuggerState::StoppedAtStepping
+        {
+            // GDB prints "Remote debugging using ..." on success.
+            // If we see Error, keep previous is_remote=false.
+            self.is_remote = true;
+        } else if response.debugger_state == DebuggerState::Error {
+            // Do not mark as remote on failure.
+        }
+        // Return response with possibly updated base state (is_remote tracked separately).
+        Ok(response)
+    }
+
+    async fn execute_set_sysroot(&mut self, path: &str) -> Result<DebuggerResponse> {
+        let sanitized = sanitize_gdb_input(path.trim());
+        if sanitized.is_empty() {
+            self.debugger_state = DebuggerState::Error;
+            self.last_error = "sysroot path must not be empty".to_string();
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
+        self.execute_command(&format!("set sysroot {sanitized}"), None)
+            .await
+    }
+
+    async fn execute_set_solib_search_path(&mut self, path: &str) -> Result<DebuggerResponse> {
+        let sanitized = sanitize_gdb_input(path.trim());
+        if sanitized.is_empty() {
+            self.debugger_state = DebuggerState::Error;
+            self.last_error = "solib-search-path must not be empty".to_string();
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
+        self.execute_command(&format!("set solib-search-path {sanitized}"), None)
+            .await
+    }
+
+    async fn execute_set_architecture(&mut self, arch: &str) -> Result<DebuggerResponse> {
+        let sanitized = sanitize_gdb_input(arch.trim());
+        if sanitized.is_empty() {
+            self.debugger_state = DebuggerState::Error;
+            self.last_error = "architecture must not be empty".to_string();
+            return Ok(self.base_response().with_error(self.last_error.clone()));
+        }
+        // `set architecture auto` lets GDB pick from ELF; explicit `aarch64` etc. forces it.
+        self.execute_command(&format!("set architecture {sanitized}"), None)
+            .await
+    }
+
+    async fn debugger_state_response(&mut self) -> Result<DebuggerResponse> {
+        // If not attached nothing to query.
+        if self.executable_path.is_none()
+            || matches!(
+                self.debugger_state,
+                DebuggerState::NotAttached
+                    | DebuggerState::FailedToAttach
+                    | DebuggerState::GdbServerFailedToAttach
+            )
+        {
+            return Ok(self.base_response());
+        }
+        // When the inferior is Running, GDB's synchronous CLI is busy and
+        // `info program` would block until the program stops (or timeout).
+        // To avoid a 10s stall on every poll, return the cached Running state
+        // quickly. Clients that need to detect a stop should poll via
+        // `gdb_full_backtrace` / `gdb_info_threads` (which will interrupt and
+        // resync) or wait for `gdb_continue` to report the stop.
+        if self.debugger_state == DebuggerState::Running {
+            return Ok(self.base_response());
+        }
+        // Query GDB for actual state without interrupting a running target if possible.
+        // `info program` is cheap and reflects exit / signal conditions.
+        let previous = self.debugger_state;
+        let query_result = self.backend.exec("info program").await;
+        match query_result {
+            Ok(output) => {
+                let lower = output.to_ascii_lowercase();
+                let saved_state = self.debugger_state;
+                let saved_reason = self.stop_reason.clone();
+                self.update_state_from_output(&output, Some(saved_state));
+                let new_state = self.debugger_state;
+                if new_state == DebuggerState::Error && !looks_like_gdb_error(&output) {
+                    self.debugger_state = previous;
+                    self.stop_reason = saved_reason;
+                } else if lower.contains("not being run") || lower.contains("no program") {
+                    self.debugger_state = DebuggerState::Attached;
+                } else if lower.contains("is executing") || lower.contains("is running") {
+                    self.debugger_state = DebuggerState::Running;
+                    self.stop_reason = None;
+                } else if new_state != saved_state && new_state != DebuggerState::Error {
+                    // keep inferred meaningful change (e.g., sigsegv)
+                } else {
+                    self.debugger_state = previous;
+                    self.stop_reason = saved_reason;
+                    if previous != DebuggerState::Error {
+                        self.last_error.clear();
+                    }
+                }
+                if !looks_like_gdb_error(&output) && self.debugger_state != DebuggerState::Error {
+                    self.last_error.clear();
+                }
+            }
+            Err(err) => {
+                self.debugger_state = DebuggerState::Error;
+                self.last_error = err.to_string();
+                return Ok(self.base_response().with_error(self.last_error.clone()));
+            }
+        }
+        Ok(self.base_response())
     }
 
     async fn execute_with_full_snapshot(
@@ -1411,6 +1623,8 @@ impl<'a> SessionCore<'a> {
         self.stop_reason = None;
 
         // GDB command failures should be surfaced as Error state.
+        // Include remote Debugging failure strings so `target remote` mis-connects don't silently become Attached,
+        // plus multiarch/mismatch strings so loading an aarch64 ELF with a native x64 GDB fails loudly.
         if lower.contains("undefined command")
             || lower.contains("ambiguous command")
             || lower.contains("not recognized")
@@ -1425,6 +1639,23 @@ impl<'a> SessionCore<'a> {
             || lower.contains("not meaningful in the outermost frame")
             || lower.contains("can't attach")
             || lower.contains("unable to attach")
+            || lower.contains("connection timed out")
+            || lower.contains("connection refused")
+            || lower.contains("no route to host")
+            || lower.contains("remote communication error")
+            || lower.contains("remote connection closed")
+            || lower.contains("failed to connect")
+            || lower.contains("unable to connect")
+            || lower.contains("timed out trying")
+            || lower.contains("could not connect to remote target")
+            || lower.contains("connection closed by remote host")
+            || lower.contains("already being debugged")
+            || lower.contains("already attached")
+            || lower.contains("file format not recognized")
+            || lower.contains("not in executable format")
+            || lower.contains("architecture of file not recognized")
+            || lower.contains("exec format error")
+            || lower.contains("cannot execute binary file")
             || lower.contains("error:")
         {
             self.debugger_state = DebuggerState::Error;
@@ -1890,7 +2121,18 @@ fn parse_examine_memory_rows(output: &str) -> BTreeMap<String, String> {
 }
 
 fn sanitize_gdb_input(input: &str) -> String {
-    input.replace(['\n', '\r'], " ")
+    // Replace newlines and strip command separators that could chain
+    // arbitrary GDB commands (e.g. "main; shell rm ...").
+    // Keep the original text otherwise; `gdb_custom` is the intended
+    // escape hatch for raw GDB syntax.
+    let mut out = input.replace(['\n', '\r'], " ");
+    // Replace suspicious GDB command chaining chars with space to avoid
+    // `break main; shell` style injection via location/expression args.
+    // We preserve them for `gdb_custom` which bypasses this helper.
+    if out.contains(';') {
+        out = out.replace(';', " ");
+    }
+    out
 }
 
 fn normalize_gdb_value(output: &str) -> String {
@@ -1930,6 +2172,21 @@ fn looks_like_gdb_error(output: &str) -> bool {
         || lower.contains("not meaningful in the outermost frame")
         || lower.contains("can't attach")
         || lower.contains("unable to attach")
+        || lower.contains("connection timed out")
+        || lower.contains("connection refused")
+        || lower.contains("no route to host")
+        || lower.contains("remote communication error")
+        || lower.contains("remote connection closed")
+        || lower.contains("failed to connect")
+        || lower.contains("unable to connect")
+        || lower.contains("timed out trying")
+        || lower.contains("could not connect to remote target")
+        || lower.contains("connection closed by remote host")
+        || lower.contains("file format not recognized")
+        || lower.contains("not in executable format")
+        || lower.contains("architecture of file not recognized")
+        || lower.contains("exec format error")
+        || lower.contains("cannot execute binary file")
         || lower.contains("error:")
         || lower.contains("cannot access memory")
 }

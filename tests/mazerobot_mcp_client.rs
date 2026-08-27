@@ -32,6 +32,7 @@ fn mazerobot_config() -> ServerConfig {
     ServerConfig {
         gdb_path: "/usr/bin/gdb".into(),
         gdb_options: String::new(),
+        gdbserver_path: "gdbserver".into(),
         codebase_dir: maze_codebase_dir(),
         executable_path: maze_binary_path(),
         mcp_server_name: "MCP GDB Server".to_string(),

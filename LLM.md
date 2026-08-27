@@ -25,13 +25,17 @@ Rules:
   5) inspect state (gdb_current_code, gdb_variable_list, gdb_full_backtrace, gdb_info_threads, gdb_info_regs, gdb_print)
   6) if session is in `error`/signal state and you need a clean slate, call gdb_reset_back_to_not_attached
   7) stop session with gdb_quit
-- Use this loop repeatedly for remote debugging:
-  1) gdb_gdbserver          starts gdbserver
-  2) gdb_target_remote      attach to gdbserver via ip:port
-  3) gdb_add_variable_list  watches variable
-  4) gdb_add_breakpoint     breakpoint setup
-  5) gdb_continue           resume running
-  6) gdb_step/gdb_next/gdb_continue loops same as above
+- Use this loop repeatedly for remote debugging when ANOTHER host already runs gdbserver (your primary use case):
+  1) gdb_execute            local symbol file identical to remote binary (absolute path)
+  2) gdb_set_sysroot / gdb_set_solib_search_path  if remote libraries need sysroot
+  3) gdb_target_remote      attach to gdbserver via ip:port (or gdb_target_extended_remote for gdbserver --multi)
+  4) gdb_add_variable_list  watches variable
+  5) gdb_add_breakpoint     breakpoint setup
+  6) gdb_continue           resume running (gdb_run is invalid for remote)
+  7) gdb_step/gdb_next/gdb_continue loops same as above
+- Use this loop if the MCP host itself must start gdbserver locally:
+  1) gdb_gdbserver          starts `gdbserver --attach ip:port pid` locally
+  2) gdb_target_remote      then connect to it (as above)
 - When modifying values, use gdb_set_var (or gdb_print with value).
 - If debugger_state is `not attached` or `failed to attach`, recover by calling gdb_execute again with the correct absolute executable path.
 - If debugger_state indicates a signal (sigsegv/sigabrt/sigbus/sigfpe/sigill/sigtrap/sigterm/sigkill), immediately collect:
@@ -64,7 +68,25 @@ gdb_quit {}
 gdb_reset_back_to_not_attached {}
 ```
 
-Examples of Starting a remote gdbserver and attaching to it and debugging
+Examples of Remote debugging when another host already runs gdbserver (primary remote use case):
+```
+gdb_execute {"executable_path":"/absolute/path/to/local_copy_of_remote_binary"}
+gdb_set_sysroot {"path":"/path/to/sysroot"}  // optional for shared libs
+gdb_target_remote {"ip":"192.168.1.50","port":11444}
+gdb_debugger_state {}
+gdb_add_variable_list {"var":"robot->sim->robot_row"}
+gdb_add_breakpoint {"location":"/absolute/path/to/mazerobot/src/main.c:20"}
+gdb_continue {}
+gdb_next {}
+gdb_step {}
+gdb_interrupt {}
+gdb_print {"expression":"counter"}
+gdb_full_backtrace {}
+gdb_quit {}
+gdb_reset_back_to_not_attached {}
+```
+
+Examples of Starting a local gdbserver and attaching to it (MCP host starts gdbserver):
 ```
 gdb_gdbserver {"ip":"127.0.0.1","port":11444,"pid":149104}
 gdb_target_remote {"ip":"127.0.0.1","port":11444}
@@ -80,6 +102,7 @@ gdb_full_backtrace {}
 gdb_quit {}
 gdb_reset_back_to_not_attached {}
 ```
+For gdbserver --multi use `gdb_target_extended_remote` instead of `gdb_target_remote`.
 
 ## 3. Tool Reference (All Tools)
 
@@ -131,21 +154,44 @@ gdb_run {}
 ```
 
 `gdb_gdbserver`
-- What it does: starts `gdbserver --attach <ip>:<port> <pid>` from the MCP server process.
+- What it does: starts `gdbserver --attach <ip>:<port> <pid>` from the MCP server process (local-only). For remote hosts where gdbserver already runs, skip this and use `gdb_execute` + `gdb_target_remote` directly.
 - Arguments: `ip` (string), `port` (u16), `pid` (i64, must be > 0).
-- Call this when: attaching gdbserver to a running process before connecting with `gdb_target_remote`.
-- Expected response: `gdbserver attached` on success; `failed to attach` with error details otherwise.
+- Call this when: MCP host itself must launch gdbserver for a local PID before connecting.
+- Expected response: `gdbserver attached` on success; `gdbserver failed to attach` with stderr details otherwise. Uses `gdbserver_path` config (default `gdbserver` via PATH).
 ```text
 gdb_gdbserver {"ip":"127.0.0.1","port":1234,"pid":12345}
 ```
 
 `gdb_target_remote`
-- What it does: connects GDB to a remote debug target (`target remote ip:port`).
+- What it does: connects GDB to a remote debug target (`target remote ip:port`). Requires `gdb_execute` with local symbol file first (must match remote binary).
 - Arguments: `ip` (string), `port` (u16).
 - Call this when: debugging with `gdbserver` or another remote endpoint.
-- Expected response: `attached` on success; `error` if network/target setup fails.
+- Expected response: `attached` on success; `error` if network/target setup fails (e.g. `Connection timed out`, `Connection refused` now surfaced correctly).
 ```text
 gdb_target_remote {"ip":"127.0.0.1","port":1234}
+```
+
+`gdb_target_extended_remote`
+- What it does: connects GDB to an extended remote target (`target extended-remote ip:port` for `gdbserver --multi`).
+- Arguments: `ip` (string), `port` (u16).
+- Call this when: remote uses `gdbserver --multi`.
+```text
+gdb_target_extended_remote {"ip":"127.0.0.1","port":1234}
+```
+
+`gdb_set_sysroot`
+- What it does: sets sysroot for remote library resolution (`set sysroot <path>`).
+- Arguments: `path` (string, e.g. `/path/to/sysroot` or `target:`).
+- Call this when: remote backtrace shows `??` or missing solibs.
+```text
+gdb_set_sysroot {"path":"/tmp/sysroot"}
+```
+
+`gdb_set_solib_search_path`
+- What it does: sets solib search path (`set solib-search-path <path>` colon-separated).
+- Arguments: `path` (string).
+```text
+gdb_set_solib_search_path {"path":"/lib:/usr/lib"}
 ```
 
 `gdb_set_thread`

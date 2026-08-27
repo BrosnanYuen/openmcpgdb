@@ -141,7 +141,8 @@ impl GdbBackend for RealGdbBackend {
         // Drain gdb output lines until the sentinel is observed.
         // Some commands (notably `continue`) may not promptly return to the prompt,
         // so we use a bounded wait and fall back to state inference.
-        let command_timeout = Duration::from_secs(3);
+        // Remote `target remote` needs a longer handshake over the network.
+        let command_timeout = command_timeout_for(command);
         let command_start = Instant::now();
         let mut output = String::new();
         let stdout = self
@@ -172,10 +173,11 @@ impl GdbBackend for RealGdbBackend {
         }
 
         // Collect available stderr output to preserve command failures that GDB emits on stderr.
+        // Remote failures (e.g. connection refused) can appear slightly delayed.
         if let Some(stderr) = self.stderr.as_mut() {
             loop {
                 let mut buf = [0u8; 1024];
-                match timeout(Duration::from_millis(50), stderr.read(&mut buf)).await {
+                match timeout(Duration::from_millis(150), stderr.read(&mut buf)).await {
                     Ok(Ok(0)) => break,
                     Ok(Ok(count)) => {
                         output.push_str(&String::from_utf8_lossy(&buf[..count]));
@@ -216,12 +218,27 @@ impl GdbBackend for RealGdbBackend {
             && let Some(pid) = child.id()
         {
             // Send SIGINT to the gdb process to interrupt it.
-            // This will cause gdb to stop the running debuggee and return to the prompt.
+            // This will cause gdb to send an interrupt packet to a remote stub
+            // (for `target remote`) or stop the local inferior.
             let _ = unsafe { libc::kill(pid as i32, libc::SIGINT) };
-            // Give gdb a moment to process the signal.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Remote stubs need more time for the interrupt packet round-trip.
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
         Ok(())
+    }
+}
+
+/// Per-command GDB timeout. `continue`/`run` fall back to `Running` quickly
+/// (local case) while `target remote` needs time for network handshake and
+/// symbol loading. Other commands get a moderate 10s window.
+fn command_timeout_for(command: &str) -> Duration {
+    let trimmed = command.trim_start();
+    if trimmed.starts_with("target remote") || trimmed.starts_with("target extended-remote") {
+        Duration::from_secs(15)
+    } else if trimmed == "continue" || trimmed == "run" {
+        Duration::from_secs(3)
+    } else {
+        Duration::from_secs(10)
     }
 }
 

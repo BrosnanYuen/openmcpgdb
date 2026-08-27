@@ -136,6 +136,24 @@ struct SetDisplayArgs {
     variable_list: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SysrootArgs {
+    /// Sysroot path for remote debugging (`set sysroot <path>`). Use `target:` prefix for remote fs or absolute local path.
+    path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SolibSearchPathArgs {
+    /// Colon-separated search path for shared libraries (`set solib-search-path <path>`).
+    path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ArchitectureArgs {
+    /// Architecture for `set architecture <arch>` (e.g. `aarch64`, `arm`, `auto`).
+    arch: String,
+}
+
 #[derive(Clone)]
 pub struct OpenMcpGdbServerFactory {
     config: ServerConfig,
@@ -220,7 +238,10 @@ impl OpenMcpGdbServer {
         .await
     }
 
-    #[tool(name = "gdb_target_remote", description = "Connect to remote target")]
+    #[tool(
+        name = "gdb_target_remote",
+        description = "Connect to remote target (gdb `target remote ip:port`)"
+    )]
     async fn gdb_target_remote(
         &self,
         Parameters(args): Parameters<TargetRemoteArgs>,
@@ -230,6 +251,57 @@ impl OpenMcpGdbServer {
             port: args.port,
         })
         .await
+    }
+
+    #[tool(
+        name = "gdb_target_extended_remote",
+        description = "Connect to extended remote target (gdb `target extended-remote ip:port` for gdbserver --multi)"
+    )]
+    async fn gdb_target_extended_remote(
+        &self,
+        Parameters(args): Parameters<TargetRemoteArgs>,
+    ) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::TargetExtendedRemote {
+            ip: args.ip,
+            port: args.port,
+        })
+        .await
+    }
+
+    #[tool(
+        name = "gdb_set_sysroot",
+        description = "Set sysroot for remote debugging (`set sysroot <path>`). Use for cross-target library resolution"
+    )]
+    async fn gdb_set_sysroot(
+        &self,
+        Parameters(args): Parameters<SysrootArgs>,
+    ) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::SetSysroot { path: args.path })
+            .await
+    }
+
+    #[tool(
+        name = "gdb_set_solib_search_path",
+        description = "Set solib search path for remote debugging (`set solib-search-path <path>`)"
+    )]
+    async fn gdb_set_solib_search_path(
+        &self,
+        Parameters(args): Parameters<SolibSearchPathArgs>,
+    ) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::SetSolibSearchPath { path: args.path })
+            .await
+    }
+
+    #[tool(
+        name = "gdb_set_architecture",
+        description = "Set GDB architecture (`set architecture <arch>`, e.g. aarch64, arm, auto) for multi-arch cross debugging"
+    )]
+    async fn gdb_set_architecture(
+        &self,
+        Parameters(args): Parameters<ArchitectureArgs>,
+    ) -> Json<DebuggerResponse> {
+        self.call_operation(ToolOperation::SetArchitecture { arch: args.arch })
+            .await
     }
 
     #[tool(name = "gdb_set_thread", description = "Set current thread")]
@@ -574,6 +646,7 @@ mod tests {
         ServerConfig {
             gdb_path: "/usr/bin/gdb".into(),
             gdb_options: String::new(),
+            gdbserver_path: "gdbserver".into(),
             codebase_dir: "/tmp".into(),
             executable_path: "/tmp/exe".into(),
             mcp_server_name: "MCP GDB Server".to_string(),
